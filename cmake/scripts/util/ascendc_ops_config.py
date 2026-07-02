@@ -164,6 +164,12 @@ def add_op_config(op_file, bin_info, config):
     op_cfg.get('binList').append(bin_info)
 
 
+def get_runtime_config_alias(op_type):
+    if op_type == 'RecomputeWUFwd':
+        return 'recompute_w_u_fwd.json'
+    return None
+
+
 def gen_ops_config(json_file, soc, binary_info_config, config):
     core_type_map = {'MIX': 0, 'AiCore': 1, 'VectorCore': 2, 'MIX_AICORE': 3, 'MIX_VECTOR_CORE': 4, 'MIX_AIV': 4}
     contents = load_json(json_file)
@@ -218,6 +224,9 @@ def gen_ops_config(json_file, soc, binary_info_config, config):
 
     bin_info['binInfo'] = {'jsonFilePath': os.path.join(soc, op_dir, json_base_name)}
     add_op_config(op_file, bin_info, config)
+    runtime_op_file = get_runtime_config_alias(op_type)
+    if runtime_op_file is not None and runtime_op_file != op_file:
+        add_op_config(runtime_op_file, dict(bin_info), config)
 
 
 def check_single_op_is_void(root_dir):

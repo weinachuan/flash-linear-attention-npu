@@ -573,6 +573,11 @@ function(add_bin_compile_target)
                     DEPENDS ${OP_BIN_OUT_DIR}
             )
 
+            set(runtime_op_file "")
+            if ("${op_type}" STREQUAL "RecomputeWUFwd")
+                set(runtime_op_file "recompute_w_u_fwd")
+            endif()
+
             if (ENABLE_BUILT_IN)
                 install(DIRECTORY ${OP_BIN_OUT_DIR}
                         DESTINATION ${_INSTALL_DIR}/${BINARY_COMPUTE_UNIT}/ops_transformer OPTIONAL
@@ -580,6 +585,11 @@ function(add_bin_compile_target)
                 install(FILES ${BIN_OUT_DIR}/${op_file}.json
                         DESTINATION ${_INSTALL_DIR}/config/${BINARY_COMPUTE_UNIT}/ops_transformer OPTIONAL
                 )
+                if (NOT "${runtime_op_file}" STREQUAL "" AND NOT "${runtime_op_file}" STREQUAL "${op_file}")
+                    install(FILES ${BIN_OUT_DIR}/${runtime_op_file}.json
+                            DESTINATION ${_INSTALL_DIR}/config/${BINARY_COMPUTE_UNIT}/ops_transformer OPTIONAL
+                    )
+                endif()
             else()
                 install(DIRECTORY ${OP_BIN_OUT_DIR}
                         DESTINATION ${_INSTALL_DIR}/${BINARY_COMPUTE_UNIT} OPTIONAL
@@ -587,6 +597,11 @@ function(add_bin_compile_target)
                 install(FILES ${BIN_OUT_DIR}/${op_file}.json
                         DESTINATION ${_INSTALL_DIR}/config/${BINARY_COMPUTE_UNIT} OPTIONAL
                 )
+                if (NOT "${runtime_op_file}" STREQUAL "" AND NOT "${runtime_op_file}" STREQUAL "${op_file}")
+                    install(FILES ${BIN_OUT_DIR}/${runtime_op_file}.json
+                            DESTINATION ${_INSTALL_DIR}/config/${BINARY_COMPUTE_UNIT} OPTIONAL
+                    )
+                endif()
             endif()
         endif ()
 
