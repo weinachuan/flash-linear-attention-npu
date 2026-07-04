@@ -19,6 +19,7 @@ ASCENDC_NAMES = (
     "prepare_wy_repr_bwd_da",
     "prepare_wy_repr_bwd_full",
     "recompute_w_u_fwd",
+    "solve_tri",
 )
 
 TRITON_NAMES = (
@@ -32,6 +33,7 @@ TRITON_NAMES = (
 REQUIRED_ASCENDC_CONFIGS = (
     "recompute_wu_fwd.json",
     "recompute_w_u_fwd.json",
+    "solve_tri.json",
 )
 
 
