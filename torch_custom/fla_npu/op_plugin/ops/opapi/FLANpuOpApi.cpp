@@ -14,6 +14,8 @@
 // limitations under the License.
 
 #include <cstdint>
+#include <cstdlib>
+#include <dlfcn.h>
 #include <string>
 #include <vector>
 #include <torch/library.h>
@@ -26,6 +28,33 @@ using npu_preparation = at_npu::native::OpPreparation;
 using namespace op_plugin::utils;
 using namespace op_infer;
 
+namespace {
+void* GetEmbeddedOpApiHandler()
+{
+    const char* opApiLib = std::getenv("FLA_NPU_OP_API_LIB");
+    if (opApiLib == nullptr || opApiLib[0] == '\0') {
+        return nullptr;
+    }
+    return dlopen(opApiLib, RTLD_LAZY | RTLD_GLOBAL);
+}
+
+void* GetEmbeddedOpApiFuncAddr(const char* apiName)
+{
+    static void* handler = GetEmbeddedOpApiHandler();
+    if (handler == nullptr) {
+        return nullptr;
+    }
+    return dlsym(handler, apiName);
+}
+}  // namespace
+
+void* GetOpApiFuncAddr(const char* apiName)
+{
+    if (auto funcAddr = GetEmbeddedOpApiFuncAddr(apiName)) {
+        return funcAddr;
+    }
+    return op_plugin::utils::GetOpApiFuncAddr(apiName);
+}
 
 ::std::tuple<at::Tensor,at::Tensor,at::Tensor,at::Tensor> npu_prepare_wy_repr_bwd_full(const at::Tensor & k, const at::Tensor & v, const at::Tensor & beta, const at::Tensor & A, const at::Tensor & dA, const at::Tensor & dw, const at::Tensor & du, const at::Tensor & g, int64_t chunk_size, at::OptionalIntArrayRef cu_seqlens, at::OptionalIntArrayRef chunk_indices)
 {
