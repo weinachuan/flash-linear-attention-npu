@@ -351,17 +351,19 @@ jobs:
           path: repo
 
       - name: 现场合并 PR 代码
+        timeout-minutes: 10
         working-directory: repo
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           pr_head_ref="refs/remotes/pull/${NPU_CI_PR_NUMBER}/head"
+          fetch_timeout_seconds=75
 
           fetch_with_retry() {
             local description="$1"
             shift
-            local delays=(0 15 30 60 120 180)
+            local delays=(0 10 20 40 80)
             local attempt=1
             local total="${#delays[@]}"
             local delay
@@ -371,8 +373,15 @@ jobs:
                 sleep "$delay"
               fi
               echo "[CI] ${description}: git fetch attempt ${attempt}/${total}."
-              if git -c protocol.version=2 -c http.version=HTTP/1.1 fetch "$@"; then
+              if timeout --kill-after=5s "${fetch_timeout_seconds}s" git -c protocol.version=2 -c http.version=HTTP/1.1 fetch "$@"; then
                 return 0
+              else
+                local status="$?"
+              fi
+              if [ "$status" = "124" ]; then
+                echo "[CI] ${description}: git fetch attempt ${attempt}/${total} timed out after ${fetch_timeout_seconds}s."
+              else
+                echo "[CI] ${description}: git fetch attempt ${attempt}/${total} failed with exit code ${status}."
               fi
               attempt=$((attempt + 1))
             done
