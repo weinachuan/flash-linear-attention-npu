@@ -311,7 +311,7 @@ jobs:
         with:
           repository: ${{ github.repository }}
           ref: refs/heads/${{ needs.prepare.outputs.base_ref }}
-          fetch-depth: 1
+          fetch-depth: 50
           path: repo
 
       - name: 等待后重试拉取目标分支代码
@@ -329,7 +329,7 @@ jobs:
         with:
           repository: ${{ github.repository }}
           ref: refs/heads/${{ needs.prepare.outputs.base_ref }}
-          fetch-depth: 1
+          fetch-depth: 50
           path: repo
 
       - name: 再次等待后重试拉取目标分支代码
@@ -345,7 +345,7 @@ jobs:
         with:
           repository: ${{ github.repository }}
           ref: refs/heads/${{ needs.prepare.outputs.base_ref }}
-          fetch-depth: 1
+          fetch-depth: 50
           path: repo
 
       - name: 现场合并 PR 代码
@@ -360,7 +360,14 @@ jobs:
             if [ "$delay" != "0" ]; then
               sleep "$delay"
             fi
-            git fetch --no-tags --prune --no-recurse-submodules --depth=1 origin \
+            git fetch --no-tags --prune --no-recurse-submodules --depth=50 origin \
+              "+refs/pull/${NPU_CI_PR_NUMBER}/head:refs/remotes/pull/${NPU_CI_PR_NUMBER}/head"
+          }
+
+          deepen_merge_history() {
+            echo "[CI] Shallow checkout does not contain merge base; deepening base and PR head history."
+            git fetch --no-tags --prune --no-recurse-submodules --deepen=200 origin \
+              "+refs/heads/${NPU_CI_BASE_REF}:refs/remotes/origin/${NPU_CI_BASE_REF}" \
               "+refs/pull/${NPU_CI_PR_NUMBER}/head:refs/remotes/pull/${NPU_CI_PR_NUMBER}/head"
           }
 
@@ -370,10 +377,18 @@ jobs:
             echo "[CI][ERROR] PR head changed before merge; target=${NPU_CI_TARGET_SHA}, fetched=${fetched_head}."
             exit 1
           fi
+          if ! git merge-base HEAD "refs/remotes/pull/${NPU_CI_PR_NUMBER}/head" >/dev/null; then
+            deepen_merge_history
+          fi
+          if ! git merge-base HEAD "refs/remotes/pull/${NPU_CI_PR_NUMBER}/head" >/dev/null; then
+            echo "[CI][ERROR] Unable to find merge base between current base ${NPU_CI_BASE_REF} and PR head after deepening history."
+            exit 1
+          fi
 
           git merge --no-ff --no-edit "refs/remotes/pull/${NPU_CI_PR_NUMBER}/head"
         env:
           NPU_CI_PR_NUMBER: ${{ needs.prepare.outputs.pr_number }}
+          NPU_CI_BASE_REF: ${{ needs.prepare.outputs.base_ref }}
           NPU_CI_TARGET_SHA: ${{ needs.prepare.outputs.head_sha }}
 
       - name: 拉取可信 CI 脚本（第 1 次）
