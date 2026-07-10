@@ -78,6 +78,167 @@ def _has_tensor_requiring_grad(*values) -> bool:
     return False
 
 
+def _is_ascend950_tensor(value) -> bool:
+    try:
+        import torch
+    except Exception:
+        return False
+
+    if not isinstance(value, torch.Tensor) or value.device.type != "npu":
+        return False
+
+    try:
+        device_index = value.device.index
+        if device_index is None:
+            device_index = torch.npu.current_device()
+        return "ascend950" in torch.npu.get_device_name(device_index).lower()
+    except Exception:
+        return False
+
+
+def _torch_fwd_h_fixed_len(
+    k,
+    w,
+    u,
+    g,
+    initial_state,
+    output_final_state: bool,
+    chunk_size: int,
+):
+    import torch
+
+    batch, heads, tokens, k_dim = k.shape
+    v_dim = u.shape[-1]
+    num_chunks = (tokens + chunk_size - 1) // chunk_size
+
+    h_out = torch.zeros((batch, heads, num_chunks, k_dim, v_dim), dtype=k.dtype, device=k.device)
+    v_new = torch.empty_like(u)
+
+    if initial_state is None:
+        h_state = torch.zeros((batch, heads, k_dim, v_dim), dtype=torch.float32, device=k.device)
+    else:
+        h_state = initial_state.float()
+        h_out[:, :, 0] = h_state.to(k.dtype)
+
+    for chunk_idx in range(num_chunks):
+        token_start = chunk_idx * chunk_size
+        token_end = min(token_start + chunk_size, tokens)
+
+        k_block = k[:, :, token_start:token_end, :].float()
+        w_block = w[:, :, token_start:token_end, :].float()
+        u_block = u[:, :, token_start:token_end, :].float()
+        g_block = g[:, :, token_start:token_end].float()
+        g_last = g_block[:, :, -1]
+
+        decay = torch.exp(g_last.unsqueeze(-1) - g_block).unsqueeze(-1)
+        v_block = (u_block - torch.matmul(w_block, h_state)) * decay
+        v_new[:, :, token_start:token_end, :] = v_block.to(u.dtype)
+
+        h_state = torch.exp(g_last).unsqueeze(-1).unsqueeze(-1) * h_state
+        h_state = h_state + torch.matmul(k_block.transpose(-1, -2), v_block)
+        if chunk_idx + 1 < num_chunks:
+            h_out[:, :, chunk_idx + 1] = h_state.to(k.dtype)
+
+    final_state = h_state.to(k.dtype) if output_final_state else None
+    return h_out, v_new, final_state
+
+
+def chunk_gated_delta_rule_fwd_h(
+    k,
+    w,
+    u,
+    g=None,
+    *,
+    gk=None,
+    initial_state=None,
+    output_final_state=False,
+    chunk_size=None,
+    save_new_value=True,
+    cu_seqlens=None,
+    chunk_indices=None,
+    use_exp2=False,
+    transpose_state_layout=False,
+):
+    chunk_size_ = 64 if chunk_size is None else int(chunk_size)
+    output_final_state_ = bool(output_final_state)
+    save_new_value_ = True if save_new_value is None else bool(save_new_value)
+    use_exp2_ = False if use_exp2 is None else bool(use_exp2)
+    transpose_state_layout_ = False if transpose_state_layout is None else bool(transpose_state_layout)
+
+    can_use_a5_fallback = (
+        _is_ascend950_tensor(k)
+        and g is not None
+        and gk is None
+        and cu_seqlens is None
+        and chunk_indices is None
+        and not use_exp2_
+        and not transpose_state_layout_
+        and save_new_value_
+        and k.dim() == 4
+        and w.dim() == 4
+        and u.dim() == 4
+        and g.dim() == 3
+        and k.shape[:3] == w.shape[:3] == u.shape[:3]
+        and k.shape[:2] == g.shape[:2]
+        and k.shape[2] == g.shape[2]
+        and chunk_size_ > 0
+    )
+    if can_use_a5_fallback:
+        return _torch_fwd_h_fixed_len(k, w, u, g, initial_state, output_final_state_, chunk_size_)
+
+    return _get_torch_op("npu_chunk_gated_delta_rule_fwd_h")(
+        k,
+        w,
+        u,
+        g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        use_exp2=use_exp2,
+        transpose_state_layout=transpose_state_layout,
+    )
+
+
+def solve_tri(
+    x,
+    *,
+    cu_seqlens=None,
+    chunk_indices=None,
+    layout="bsnd",
+):
+    layout_ = "bsnd" if layout is None else str(layout).lower()
+    if (
+        _is_ascend950_tensor(x)
+        and layout_ == "bsnd"
+        and cu_seqlens is None
+        and chunk_indices is None
+        and x.dim() == 4
+    ):
+        from fla_npu.ops.triton import solve_tril_npu
+
+        return solve_tril_npu(
+            A=x,
+            cu_seqlens=None,
+            chunk_indices_out=None,
+            output_dtype=x.dtype,
+        )
+
+    return _get_torch_op("npu_solve_tri")(
+        x,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        layout=layout,
+    )
+
+
+_chunk_gated_delta_rule_fwd_h = chunk_gated_delta_rule_fwd_h
+_solve_tri = solve_tri
+
+
 class _FastGeluCustomFunction:
     @staticmethod
     def apply(input_tensor):
@@ -220,6 +381,10 @@ for _name in _ASCENDC_OPS:
     globals()[_name] = _make_raw_wrapper(_name)
     globals()[_strip_npu_prefix(_name)] = globals()[_name]
 
+globals()["npu_chunk_gated_delta_rule_fwd_h"] = _chunk_gated_delta_rule_fwd_h
+globals()["chunk_gated_delta_rule_fwd_h"] = _chunk_gated_delta_rule_fwd_h
+globals()["npu_solve_tri"] = _solve_tri
+globals()["solve_tri"] = _solve_tri
 globals()["fast_gelu_custom"] = fast_gelu_custom
 globals()["causal_conv1d"] = causal_conv1d
 
