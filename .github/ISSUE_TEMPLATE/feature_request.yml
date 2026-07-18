@@ -1,0 +1,41 @@
+name: 需求
+description: 提出新功能、新算子、能力增强或行为改进需求
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景
+      description: 请说明业务、模型、算子或使用场景背景。
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题
+      description: 请说明当前能力缺口、痛点或限制。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望实现的功能
+      description: 请描述希望新增或调整的功能、接口、行为或覆盖范围。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 推荐的实现方案（可选）
+      description: 如有建议方案、接口草案、shape/dtype/layout 范围或兼容性要求，请在这里说明。
+    validations:
+      required: false
+  - type: textarea
+    id: tests
+    attributes:
+      label: 相关闭环测试建议（可选）
+      description: 如有推荐的精度、性能、边界、端到端或回归测试场景，请在这里说明。
+    validations:
+      required: false

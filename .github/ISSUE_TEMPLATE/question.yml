@@ -1,0 +1,41 @@
+name: 问题咨询
+description: 咨询 fla_npu 使用、构建、测试、算子行为或适配问题
+title: "[Question]: "
+labels:
+  - question
+body:
+  - type: textarea
+    id: background
+    attributes:
+      label: 背景
+      description: 请说明当前使用场景、目标、相关算子或调用链。
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题
+      description: 请明确你想咨询的问题，以及当前卡住的位置。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望实现的功能
+      description: 请说明希望得到的能力、结论、指导或行为。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 推荐的实现方案（可选）
+      description: 如已有尝试方案、接口设想或排查思路，请在这里说明。
+    validations:
+      required: false
+  - type: textarea
+    id: tests
+    attributes:
+      label: 相关闭环测试建议（可选）
+      description: 如有希望覆盖的验证场景、最小样例或回归方式，请在这里说明。
+    validations:
+      required: false
