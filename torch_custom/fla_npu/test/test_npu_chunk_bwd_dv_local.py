@@ -9,6 +9,8 @@ from utils import generate_cu_seqlens, compare_tensors_by_ratio, create_incremen
 import ct
 import fla_npu
 
+fla_npu.load_legacy_torch_ops()
+
 torch.npu.config.allow_internal_format = False
 torch.npu.set_compile_mode(jit_compile=False)
 torch.npu.set_device(int(os.environ.get("TEST_DEVICE_ID", 0)))

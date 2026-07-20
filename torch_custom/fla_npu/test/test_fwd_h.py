@@ -12,6 +12,8 @@ import math
 # import custom_ops
 import fla_npu
 
+fla_npu.load_legacy_torch_ops()
+
 torch.npu.config.allow_internal_format = False
 torch.npu.set_compile_mode(jit_compile=False)
 

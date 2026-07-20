@@ -4,6 +4,8 @@ import os
 # import custom_ops
 import fla_npu
 
+fla_npu.load_legacy_torch_ops()
+
 os.environ['TBE_PARALLEL_COMPILE_ENABLE'] = '0'
 os.environ['PARALLEL_COMPILE'] = '0'
 

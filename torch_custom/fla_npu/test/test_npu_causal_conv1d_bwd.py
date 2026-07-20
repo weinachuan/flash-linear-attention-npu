@@ -6,6 +6,8 @@ import torch_npu
 
 import fla_npu
 
+fla_npu.load_legacy_torch_ops()
+
 
 torch.npu.set_device(int(os.environ.get("TEST_DEVICE_ID", 0)))
 

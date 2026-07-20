@@ -105,16 +105,19 @@ source ${FLA_NPU_OPP_INSTALL_PATH}/vendors/fla_npu_transformer/bin/set_env.bash
 python -m pip install --force-reinstall --no-deps torch_custom/fla_npu/dist/fla_npu-*.whl
 ```
 
-`import fla_npu` 会优先使用 wheel 内嵌 OPP，找不到时会继续从 `FLA_NPU_OPP_PATH`、`ASCEND_CUSTOM_OPP_PATH` 和 `ASCEND_OPP_PATH` 查找已安装 OPP。
+`import fla_npu` 是轻量导入，不会自动导入 `torch` / `torch_npu`，也不会自动注册 `torch.ops.npu`。只有显式调用 `fla_npu.load_legacy_torch_ops()` 时，才会加载兼容旧 `torch.ops.npu.*` 调用的扩展库，并优先使用 wheel 内嵌 OPP，找不到时继续从 `FLA_NPU_OPP_PATH`、`ASCEND_CUSTOM_OPP_PATH` 和 `ASCEND_OPP_PATH` 查找已安装 OPP。
 
 ### Step 4. 测试安装成功
 
 安装后两种方式均可用以下命令验证：
 
 ```sh
-python -c "import fla_npu; import torch; print(hasattr(torch.ops.npu, 'npu_chunk_fwd_o'))"
+python -c "import fla_npu; print(fla_npu.is_legacy_torch_ops_loaded())"
+python -c "import fla_npu; fla_npu.load_legacy_torch_ops(); import torch; print(hasattr(torch.ops.npu, 'npu_chunk_fwd_o'))"
 python scripts/check_packaged_wheel_api.py
 ```
+
+`torch.ops.npu.*` 是兼容旧代码的过渡用法，调用时会产生 `FutureWarning`，后续版本不再支持。新代码优先使用 `fla_npu.ops.ascendc` 下的稳定 Python 入口。
 
 ### 测试单算子
 

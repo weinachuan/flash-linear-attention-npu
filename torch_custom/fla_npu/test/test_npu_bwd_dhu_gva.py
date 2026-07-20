@@ -10,6 +10,8 @@ from typing import Optional
 
 import ct
 import fla_npu
+
+fla_npu.load_legacy_torch_ops()
 import torch
 import torch_npu
 

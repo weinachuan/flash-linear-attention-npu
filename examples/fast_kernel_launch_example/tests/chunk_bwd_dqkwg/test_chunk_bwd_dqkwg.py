@@ -441,6 +441,12 @@ def chunk_bwd_dqkwg_ref(
     dw_out = dw_ref.permute(0, 2, 1, 3).contiguous()#.to(torch.float32)
     dg_out = dg_ref.permute(0, 2, 1).contiguous()#.to(torch.float32)
 
+    if n_ratio > 1:
+        B, HV, T, K = dq_out.shape
+        HK = HV // n_ratio
+        dq_out = dq_out.reshape(B, HK, n_ratio, T, K).sum(dim=2).contiguous()
+        dk_out = dk_out.reshape(B, HK, n_ratio, T, K).sum(dim=2).contiguous()
+
     return dq_out, dk_out, dw_out, dg_out
 
 
@@ -633,8 +639,8 @@ def test_chunk_bwd_dqkwg_output_shapes():
         w=None, g_gamma=None, cu_seqlens=None, chunk_indices=None
     )
 
-    assert dq.shape == (B, HV, T, K), f"dq shape mismatch: expected {(B, HV, T, K)}, got {dq.shape}"
-    assert dk.shape == (B, HV, T, K), f"dk shape mismatch: expected {(B, HV, T, K)}, got {dk.shape}"
+    assert dq.shape == (B, HK, T, K), f"dq shape mismatch: expected {(B, HK, T, K)}, got {dq.shape}"
+    assert dk.shape == (B, HK, T, K), f"dk shape mismatch: expected {(B, HK, T, K)}, got {dk.shape}"
     assert dw.shape == (B, HV, T, K), f"dw shape mismatch: expected {(B, HV, T, K)}, got {dw.shape}"
     assert dg.shape == (B, HV, T), f"dg shape mismatch: expected {(B, HV, T)}, got {dg.shape}"
 
@@ -667,8 +673,8 @@ def test_chunk_bwd_dqkwg_gva_output_shapes():
         w=None, g_gamma=None, cu_seqlens=None, chunk_indices=None
     )
 
-    assert dq.shape == (B, HV, T, K), f"dq shape mismatch: expected {(B, HV, T, K)}, got {dq.shape}"
-    assert dk.shape == (B, HV, T, K), f"dk shape mismatch: expected {(B, HV, T, K)}, got {dk.shape}"
+    assert dq.shape == (B, HK, T, K), f"dq shape mismatch: expected {(B, HK, T, K)}, got {dq.shape}"
+    assert dk.shape == (B, HK, T, K), f"dk shape mismatch: expected {(B, HK, T, K)}, got {dk.shape}"
     assert dw.shape == (B, HV, T, K), f"dw shape mismatch: expected {(B, HV, T, K)}, got {dw.shape}"
     assert dg.shape == (B, HV, T), f"dg shape mismatch: expected {(B, HV, T)}, got {dg.shape}"
 

@@ -14,6 +14,8 @@ import torch_npu
 import numpy as np
 import fla_npu
 
+fla_npu.load_legacy_torch_ops()
+
 torch.npu.utils.set_device(0)
 
 # 是否打印每个 (b,h,c)/(seq,h,c) 点位的 OK/FAIL 明细及用例头。

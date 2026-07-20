@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from typing import Tuple
 # import custom_ops
 import fla_npu
+
+fla_npu.load_legacy_torch_ops()
 import os
 
 # 当前文件所在目录
