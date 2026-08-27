@@ -55,6 +55,7 @@ constexpr uint32_t kRegBytes = 256;
 constexpr uint32_t kFp32PerReg = kRegBytes / sizeof(float);
 constexpr uint32_t kBf16PerReg = kRegBytes / sizeof(bfloat16_t);
 constexpr uint32_t kStateElements = kKeyDim * kValueDim;
+constexpr float kLn2 = 0.6931471805599453f;
 
 inline void RegBaseCastFp32ToBf16(AscendC::Reg::RegTensor<bfloat16_t>& dst,
                                   AscendC::Reg::RegTensor<float>& src,
@@ -113,9 +114,10 @@ inline void RegBaseApplyGateDelta(AscendC::Reg::RegTensor<float>& value,
     AscendC::Reg::RegTensor<float> decay;
     AscendC::Reg::Duplicate(one, 1.0f, mask);
     if (useExp2) {
-        RegBaseExp2(decay, gate, mask);
+        AscendC::Reg::Muls(gate, gate, kLn2, mask);
+        AscendC::Reg::Exp(decay, gate, mask);
     } else {
-        RegBaseExp(decay, gate, mask);
+        AscendC::Reg::Exp(decay, gate, mask);
     }
     AscendC::Reg::Sub(decay, one, decay, mask);
     AscendC::Reg::Mul(value, value, decay, mask);
@@ -128,9 +130,10 @@ inline void RegBaseApplyStateGate(AscendC::Reg::RegTensor<float>& state,
 {
     // Stage3 使用 lambda = exp(g_last)，不是 Stage1 的 delta = 1 - exp(g)。
     if (useExp2) {
-        RegBaseExp2(gate, gate, mask);
+        AscendC::Reg::Muls(gate, gate, kLn2, mask);
+        AscendC::Reg::Exp(gate, gate, mask);
     } else {
-        RegBaseExp(gate, gate, mask);
+        AscendC::Reg::Exp(gate, gate, mask);
     }
     AscendC::Reg::Mul(state, state, gate, mask);
 }
