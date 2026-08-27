@@ -17,6 +17,7 @@ namespace fwd_h_pseudocode {
 
 inline CubeStageResult RunStage0ByArch(const CubeStage0Args& args)
 {
+    // Stage0 分发公式：P_c,h = W_c,h @ H_c,h；按目标架构选择对应 Cube 实现。
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     return RunStage0Arch35(args);
 #else
@@ -26,6 +27,7 @@ inline CubeStageResult RunStage0ByArch(const CubeStage0Args& args)
 
 inline VecStageResult RunStage1ByArch(const VecStageArgs& args)
 {
+    // Stage1 分发公式：V_new_c,h = cast_BF16(fp32(U_c,h)-fp32(P_c,h))（无 P 时取零）；按目标架构选择对应 Vec 实现。
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     return RunStage1Arch35(args);
 #else
@@ -35,6 +37,7 @@ inline VecStageResult RunStage1ByArch(const VecStageArgs& args)
 
 inline CubeStageResult RunStage2ByArch(const CubeStage2Args& args)
 {
+    // Stage2 分发公式：g-only 为 D_c,h = k_raw_c,kh^T @ V_new_g,c,h，gk-only 为 D_c,h = kg_c,kh^T @ V_new_c,h。
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     return RunStage2Arch35(args);
 #else
@@ -44,6 +47,7 @@ inline CubeStageResult RunStage2ByArch(const CubeStage2Args& args)
 
 inline VecStageResult RunStage3ByArch(const VecStage3Args& args)
 {
+    // Stage3 分发公式：R_{c+1,h} = gate(R_c,h) + D_c,h；按目标架构选择对应 Vec 实现。
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     return RunStage3Arch35(args);
 #else
@@ -53,6 +57,7 @@ inline VecStageResult RunStage3ByArch(const VecStage3Args& args)
 
 inline void RunSMinusOneByArch(const SMinusOneArgs& args)
 {
+    // S-1 分发公式：H_0,h = cast_BF16(layout_decode(initial_state_h))；按目标架构选择对应 Vec 实现。
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
     RunSMinusOneArch35(args);
 #else
@@ -62,6 +67,7 @@ inline void RunSMinusOneByArch(const SMinusOneArgs& args)
 
 inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan)
 {
+    // 单 chunk 阶段组合公式：S0 为 P=W@H，S1 为 V_new=U-P，S2 按分支计算 D，S3 为 R_next=gate(R)+D。
     const bool finalVNewOnly = plan.finalVNewOnly;
     const bool noInitialFirst = plan.chunk.first && !ctx.tiling.useInitialState;
 
@@ -95,6 +101,7 @@ inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan)
 
 inline void RunFwdH(SchedulerContext& ctx)
 {
+    // FwdH 总体公式：按 sequence -> head_round -> chunk 顺序递推 D_c,h（由 V_new_g/V_new 分支计算），R_{c+1,h}=gate(R_c,h)+D_c,h。
     // Host 校验已经建立全部 shape/dtype/layout 不变量。
     for (int n = 0; n < ctx.tiling.sequenceCount; ++n) {
         const auto& seq = ctx.tiling.sequences[n];

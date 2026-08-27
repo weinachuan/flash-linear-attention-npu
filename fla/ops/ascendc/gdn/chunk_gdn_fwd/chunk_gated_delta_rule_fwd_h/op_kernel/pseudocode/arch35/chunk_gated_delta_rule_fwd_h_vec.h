@@ -162,6 +162,7 @@ __simd_vf__ inline void SMinusOneFp32ToBf16Vf(__ubuf__ const float* srcUb,
                                               uint32_t elementCount,
                                               bool stateVFirst)
 {
+    // S-1 VF 公式：H_0,h = cast_BF16(R_0,h)，R_0,h 为 FP32 canonical [K,V]；state_v_first 只影响 GM 布局。
     uint32_t remaining = elementCount;
     uint32_t offset = 0;
     while (remaining > 0) {
@@ -198,6 +199,8 @@ __simd_vf__ inline void Stage1FullHeadVf(
     bool zeroH0,
     bool useExp2)
 {
+    // Stage1 VF 公式：V_new_fp32,c,h = fp32(U_c,h) - fp32(P_c,h)，V_new_c,h = cast_BF16(V_new_fp32,c,h)；hasP=false 时 P_c,h=0。
+    // g-only 额外计算 V_new_g,c,h[i,:] = cast_BF16(E(g_last-g_i) * V_new_fp32,c,h[i,:])；E 由 useExp2 决定。
     if (writeH0) {
         uint32_t stateRemaining = kStateElements;
         uint32_t stateOffset = 0;
@@ -270,6 +273,8 @@ __simd_vf__ inline void Stage3FullHeadVf(
     bool useExp2,
     bool stateVFirst)
 {
+    // Stage3 VF 公式：R_{c+1,h} = gate(R_c,h) + D_c,h，非末 chunk 再生成 H_{c+1,h} = cast_BF16(R_{c+1,h})。
+    // g-only 的 gate 为 alpha_c = E(g_last)，gk-only 的 gate 为 E(gk_c,h[M-1,:])；E 由 useExp2 决定。
     uint32_t remaining = elementCount;
     uint32_t offset = 0;
     while (remaining > 0) {
@@ -323,6 +328,7 @@ __simd_vf__ inline void Stage3FullHeadVf(
 
 inline void A5SMinusOneLoadInitial(const SMinusOneArgs& args, const HeadBinding& head)
 {
+    // S-1 输入公式：R_0,h = layout_decode(initial_state[n,h,:,:])，MTE2 将其搬入 UB FP32 canonical [K,V]。
     const int bank = FixedMemory::LocalBank(head);
     auto& input = args.memory->initialInput[bank];
     if (input.generation > 0 && !args.roundBoundaryDrained) {
@@ -338,6 +344,7 @@ inline void A5SMinusOneLoadInitial(const SMinusOneArgs& args, const HeadBinding&
 inline void A5SMinusOneConvertAndWriteH0(const SMinusOneArgs& args,
                                          const HeadBinding& head)
 {
+    // S-1 计算公式：H_0,h = cast_BF16(R_0,h)，RegBase VF 完成转换后由 MTE3 按 state_v_first 写 GM。
     const int bank = FixedMemory::LocalBank(head);
     args.sync->Wait(EventKind::InitialInputReady, bank, /*S-1 VF*/ 1);
     args.memory->AcquireInitialHOutput(head);
@@ -360,6 +367,7 @@ inline void A5SMinusOneConvertAndWriteH0(const SMinusOneArgs& args,
 
 inline void RunSMinusOneArch35(const SMinusOneArgs& args)
 {
+    // S-1 阶段公式：对当前 head_round 的每个 head 执行 H_0,h = cast_BF16(initial_state_h)，并发布 HGmReady。
     if (!args.tiling->useInitialState || args.tiling->stateType != StateType::Fp32) {
         return;
     }
@@ -392,6 +400,7 @@ inline void RunSMinusOneArch35(const SMinusOneArgs& args)
 inline void A5Stage1PrepareInitialOrZeroState(const VecStageArgs& args,
                                               const HeadBinding& head)
 {
+    // Stage1 初态公式：R_0,h = initial_state_h（有初态）或 0（无初态）；最终 v_new-only 不建立 rolling state。
     const RoundPlan& plan = *args.plan;
     if (!plan.chunk.first || args.tiling->stateType != StateType::Bf16) {
         return;
@@ -423,6 +432,7 @@ inline void A5Stage1PrepareInitialOrZeroState(const VecStageArgs& args,
 
 inline void A5Stage1LoadUAndGate(const VecStageArgs& args, const HeadBinding& head)
 {
+    // Stage1 输入公式：U_c,h = U[h,0:M,:]；g-only 另取 g_c,h = g[h,0:M]，无效尾行在 UB 中补零。
     const int bank = FixedMemory::LocalBank(head);
     auto& ticket = args.memory->vNewWork[bank];
     if (ticket.generation > 0 && !args.plan->roundBoundaryDrained) {
@@ -446,6 +456,7 @@ inline void A5Stage1LoadUAndGate(const VecStageArgs& args, const HeadBinding& he
 
 inline void A5Stage1ComputeAndWrite(const VecStageArgs& args, const HeadBinding& head)
 {
+    // Stage1 计算公式：V_new_fp32,c,h = fp32(U_c,h) - fp32(P_c,h)，再按分支生成 V_new、V_new_g、alpha 和 H_0。
     const RoundPlan& plan = *args.plan;
     const bool hasP = plan.stage0Required;
     if (hasP) {
@@ -536,6 +547,7 @@ inline void A5Stage1ComputeAndWrite(const VecStageArgs& args, const HeadBinding&
 
 inline void A5Stage1ReleaseWork(const VecStageArgs& args, const HeadBinding& head)
 {
+    // Stage1 释放公式：V_new 写公开 GM、右操作数写 GM ND scratch 后，释放本 head 的 UB work bank。
     const int bank = FixedMemory::LocalBank(head);
     wait_mte3_vnew_done(args.plan->chunk, head.hv);
     args.memory->ReleaseVNewWorkAfterMte3(head);
@@ -546,6 +558,7 @@ inline void A5Stage1ReleaseWork(const VecStageArgs& args, const HeadBinding& hea
 
 inline VecStageResult RunStage1Arch35(const VecStageArgs& args)
 {
+    // Stage1 阶段公式：逐 head 完成 V_new_c,h = cast_BF16(fp32(U_c,h)-fp32(P_c,h)) 及可选右操作数派生；无 P 时取零。
     VecStageResult result{};
     const RoundPlan& plan = *args.plan;
     for (int i = 0; i < plan.activeHvCount; ++i) {
@@ -566,6 +579,7 @@ inline VecStageResult RunStage1Arch35(const VecStageArgs& args)
 
 inline void A5Stage3PrepareState(const VecStage3Args& args, const HeadBinding& head)
 {
+    // Stage3 初态公式：R_c,h 来自 BF16 resident 或 FP32 rolling-state scratch；首 chunk 无初态时取零矩阵。
     const RoundPlan& plan = *args.plan;
     if (args.tiling->stateType == StateType::Bf16) {
         auto& state = args.memory->bf16State[FixedMemory::LocalBank(head)];
@@ -595,6 +609,7 @@ inline void A5Stage3PrepareState(const VecStage3Args& args, const HeadBinding& h
 
 inline void A5Stage3LoadGate(const VecStage3Args& args, const HeadBinding& head)
 {
+    // Stage3 门控公式：g-only 复用 Stage1 生成的 alpha_c = E(g_last)，gk-only 搬入 gk_c,h[M-1,:]。
     if (args.plan->gateMode != GateMode::KeyWiseGk) {
         return;
     }
@@ -606,6 +621,7 @@ inline void A5Stage3LoadGate(const VecStage3Args& args, const HeadBinding& head)
 inline void A5Stage3ComputeAndWrite(const VecStage3Args& args,
                                     const HeadBinding& head)
 {
+    // Stage3 计算公式：R_{c+1,h} = gate(R_c,h) + D_c,h；非末 chunk 将 H_{c+1,h} = cast_BF16(R_{c+1,h}) 写 GM。
     const RoundPlan& plan = *args.plan;
     args.sync->Wait(EventKind::DReady, head.roundHead, /*S3 VF*/ 3);
     if (args.tiling->stateType == StateType::Fp32 || plan.chunk.first) {
@@ -651,6 +667,7 @@ inline void A5Stage3ComputeAndWrite(const VecStage3Args& args,
 inline void A5Stage3ReleaseStateAndD(const VecStage3Args& args,
                                      const HeadBinding& head)
 {
+    // Stage3 释放公式：D_c,h 最后一次读取、R_{c+1,h}/final_state 写出后，按下一 owner 释放 state 与 D。
     const RoundPlan& plan = *args.plan;
     if (args.tiling->stateType == StateType::Bf16) {
         if (plan.hasNextChunk) {
@@ -687,6 +704,7 @@ inline void A5Stage3ReleaseStateAndD(const VecStage3Args& args,
 
 inline VecStageResult RunStage3Arch35(const VecStage3Args& args)
 {
+    // Stage3 阶段公式：逐 head 完成 R_{c+1,h} = gate(R_c,h) + D_c,h，并按末 chunk 分支写 H/final_state。
     VecStageResult result{};
     const RoundPlan& plan = *args.plan;
     if (!plan.stage3Required) {

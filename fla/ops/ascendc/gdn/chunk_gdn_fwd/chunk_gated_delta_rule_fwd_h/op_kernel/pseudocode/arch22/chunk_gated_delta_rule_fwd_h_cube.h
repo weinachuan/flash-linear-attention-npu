@@ -36,6 +36,7 @@ struct CubeStageResult {
 
 inline void Stage0LoadH(const CubeStage0Args& args, const HeadBinding& head)
 {
+    // Stage0 搬运公式：H_c,h = layout_decode(H_source,h)，并由 MTE2 将 GM 布局转为 L1 NZ。
     const RoundPlan& plan = *args.plan;
     const bool bf16Initial = plan.chunk.first && args.tiling->useInitialState &&
                              args.tiling->stateType == StateType::Bf16;
@@ -69,6 +70,7 @@ inline void Stage0LoadH(const CubeStage0Args& args, const HeadBinding& head)
 
 inline void Stage0LoadW(const CubeStage0Args& args, const HeadBinding& head)
 {
+    // Stage0 输入公式：W_c,h[i,:] = w[h,i,:]（0 <= i < M），无效尾行补零后驻留 L1。
     if (args.memory->w[head.wSlot].generation > 0 && !args.plan->roundBoundaryDrained) {
         args.sync->Wait(EventKind::WFree, head.wSlot, /*S0 MTE2*/ 0);
     }
@@ -86,6 +88,7 @@ inline void Stage0LoadW(const CubeStage0Args& args, const HeadBinding& head)
 
 inline void Stage0ComputeP(const CubeStage0Args& args, const HeadBinding& head)
 {
+    // Stage0 计算公式：P_c,h = W_c,h @ H_c,h，矩阵乘为 BF16 x BF16 -> FP32 累加。
     // S0 MTE1 只读取本 Stage 的 W/H 输入；P 由 Fixpipe 写入本 head 的 local data bank。
     args.sync->Wait(EventKind::WReady, head.wSlot, /*S0 MTE1*/ 1);
     args.sync->Wait(EventKind::HReady, head.hSlot, /*S0 MTE1*/ 1);
@@ -120,6 +123,7 @@ inline void Stage0ComputeP(const CubeStage0Args& args, const HeadBinding& head)
 
 inline CubeStageResult RunStage0Arch22(const CubeStage0Args& args)
 {
+    // Stage0 阶段公式：对每个 active head 执行 P_c,h = W_c,h @ H_c,h，并将 P 写入 UB。
     CubeStageResult result{};
     const RoundPlan& plan = *args.plan;
     if (!plan.stage0Required) {
@@ -142,6 +146,7 @@ inline CubeStageResult RunStage0Arch22(const CubeStage0Args& args)
 
 inline void Stage2LoadKgForRound(const CubeStage2Args& args)
 {
+    // Stage2 左操作数公式：kg_c,kh = k_raw_c,kh（g-only）或 kg_c,kh（gk-only），按 distinct kh 装载。
     const RoundPlan& plan = *args.plan;
     // Stage2 自己负责当前 chunk 的全部 distinct kg 搬运；Stage0 不触碰 kg。
     for (int i = 0; i < plan.requiredKhCount; ++i) {
@@ -167,6 +172,7 @@ inline void Stage2LoadKgForRound(const CubeStage2Args& args)
 
 inline void Stage2EnsureKgReady(const CubeStage2Args& args, const kg_binding& binding)
 {
+    // Stage2 kg 就绪语义：kg_c,kh[M,K] 完整搬入 L1 后，才允许映射到该 slot 的 head 做 MTE1。
     auto& ticket = args.memory->kg[binding.slot];
     if (ticket.state != SlotState::Loading) {
         // 同一 kg slot 的后续 mapped head 直接复用已经 ready 的 entry。
@@ -181,6 +187,7 @@ inline void Stage2EnsureKgReady(const CubeStage2Args& args, const kg_binding& bi
 
 inline void Stage2PrefetchRightToL1Nz(const CubeStage2Args& args, const HeadBinding& head)
 {
+    // Stage2 右操作数预取公式：g-only 搬 V_new_g,c,h，gk-only 搬 V_new_c,h；两者均由 ND 转为 NZ。
     const int rightGmSlot = head.roundHead;
     // Stage1 已经把 UB ND 写入 GM；先等 GM 写出，再异步发起 Stage2 的 ND -> NZ 搬运。
     args.sync->Wait(EventKind::RightGmReady, rightGmSlot, /*S2 MTE2*/ 0);
@@ -192,6 +199,7 @@ inline void Stage2PrefetchRightToL1Nz(const CubeStage2Args& args, const HeadBind
 
 inline void Stage2EnsureRightL1Ready(const CubeStage2Args& args, const HeadBinding& head)
 {
+    // Stage2 右操作数就绪公式：L1Right_c,h[NZ] = convert_ND_to_NZ(V_new_g/V_new[GM])。
     const int rightGmSlot = head.roundHead;
     // 预取已经发起；每个 head 的 MTE1 只在本 head 的 L1 NZ 完成后继续。
     wait_mte2_right_l1_done(head.hSlot);
@@ -206,6 +214,7 @@ inline void Stage2EnsureRightL1Ready(const CubeStage2Args& args, const HeadBindi
 
 inline void Stage2ComputeDForHead(const CubeStage2Args& args, const HeadBinding& head)
 {
+    // Stage2 计算公式：g-only 为 D_c,h = k_raw_c,kh^T @ V_new_g,c,h；gk-only 为 D_c,h = kg_c,kh^T @ V_new_c,h。
     const kg_binding& binding = args.plan->kg[head.kgSlot];
     Stage2EnsureKgReady(args, binding);
 
@@ -251,6 +260,7 @@ inline void Stage2ComputeDForHead(const CubeStage2Args& args, const HeadBinding&
 
 inline CubeStageResult RunStage2Arch22(const CubeStage2Args& args)
 {
+    // Stage2 阶段公式：先预取 Nkg_round 个 kg 和全部 V_new_g/V_new，再逐 head 按分支计算 D_c,h。
     CubeStageResult result{};
     const RoundPlan& plan = *args.plan;
     if (!plan.stage2Required) {
