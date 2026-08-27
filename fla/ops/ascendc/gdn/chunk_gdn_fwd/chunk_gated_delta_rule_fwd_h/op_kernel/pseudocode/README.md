@@ -51,6 +51,11 @@ required_hk_round(r) = unique({kh(hv) for hv in active_hv_round(r)})
 Nkg_round = len(required_hk_round(r))
 ```
 
+因此，每个 `head_round` 需要的 `H_k` 数量就是 `Nkg_round`。调度器在进入该
+`head_round` 的 chunk 循环前一次性构造 `requiredKh[]`，并固定四个 `H_v slot` 各自对应的
+`kgSlot`；同一 round 的所有 chunk 复用这张映射，只更新对应 chunk 的 kg payload。进入下一
+个 round 前先等待上一 round 的 kg 消费完成，再按下一 round 的 `requiredKh[]` 重新预取。
+
 每个 `HeadBinding` 保存完整关系：
 
 ```text
@@ -98,14 +103,19 @@ kg slot，`1:6` 生成两个 round、每个 round 一个 kg slot；第二个 rou
 ```text
 对 sequence n：
     对 head_round r：
+        headRoundPlan = BuildHeadRoundPlan(tiling, r)
+        # 这里确定 requiredKhCount 和每个 H_v -> kgSlot；它们在本 round 内不随 chunk 变化
         如果 r > 0：
-            等待前一个 round 每个有效 kg slot 的 kg_overwrite_safe
-            等待前一个 round 每个 active head 的 W_free 和 H_free
+            如果前一个 round 的最终 chunk 执行了 Stage2：
+                等待前一个 round 每个有效 kg slot 的 kg_overwrite_safe
+            如果前一个 round 的最终 chunk 执行了 Stage0：
+                等待前一个 round 每个 active head 的 W_free 和 H_free
             等待前一个 round 的 terminalDrain
             # 所有等待返回前，禁止预取任何 H/W/kg
         如果 initial_state 为 FP32，则对本 round 的 active head 执行一次 S-1
         对 chunk c：
-            plan = BuildRoundPlan(n, r, c)
+            plan = BuildChunkPlan(headRoundPlan, tiling, sequence[n], c)
+            # 这里只绑定 token 范围和 Stage 分支，不重新决定 H_k 数量或槽位映射
             如果 plan.stage0Required：
                 Stage0：异步预取恰好 Nkg_round 个 kg slot，并计算 P = W @ H
             Stage1：计算 V_new（仅在 S2 需要时计算 V_new_g/alpha）

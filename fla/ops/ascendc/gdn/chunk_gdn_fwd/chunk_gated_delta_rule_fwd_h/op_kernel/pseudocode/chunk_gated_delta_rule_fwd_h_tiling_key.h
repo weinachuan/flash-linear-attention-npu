@@ -129,9 +129,10 @@ struct RoundPlan {
     std::array<int, kMaxRoundHeads> requiredKh{};
     std::array<HeadBinding, kMaxRoundHeads> heads{};
     std::array<kg_binding, kMaxKeySlots> kg{};
-    bool stage0Required = true;
-    bool stage2Required = true;
-    bool stage3Required = true;
+    // 这三个分支依赖当前 sequence 的 chunk.first/last，只能由 BuildChunkPlan 填充。
+    bool stage0Required = false;
+    bool stage2Required = false;
+    bool stage3Required = false;
 };
 
 struct TilingPlan {

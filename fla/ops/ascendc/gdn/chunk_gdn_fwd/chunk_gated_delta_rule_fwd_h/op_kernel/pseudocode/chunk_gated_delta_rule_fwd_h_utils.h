@@ -190,13 +190,12 @@ inline ChunkSpan MakeChunk(const SequenceSpan& seq, int chunk)
     return span;
 }
 
-inline RoundPlan BuildRoundPlan(const TilingPlan& tiling, int sequence, int round, int chunk)
+// head_round 级计划只依赖 HV/HK 和门控模式，与 chunk 无关。
+// 它必须在进入 chunk 循环前构造；其中的 kg slot 数量和 H_v -> H_k 映射在整个 round 内固定。
+inline RoundPlan BuildHeadRoundPlan(const TilingPlan& tiling, int round)
 {
     RoundPlan plan{};
-    const auto& seq = tiling.sequences[sequence];
-    plan.sequence = sequence;
     plan.round = round;
-    plan.chunk = MakeChunk(seq, chunk);
     plan.gateMode = tiling.gateMode;
     plan.kg_payload_kind = tiling.gateMode == GateMode::ScalarG ? kg_payload::raw_k : kg_payload::prepared_kg;
     plan.activeHvBegin = round * kMaxRoundHeads;
@@ -204,10 +203,6 @@ inline RoundPlan BuildRoundPlan(const TilingPlan& tiling, int sequence, int roun
     if (plan.activeHvCount > kMaxRoundHeads) {
         plan.activeHvCount = kMaxRoundHeads;
     }
-    plan.stage2Required = tiling.outputFinalState || !plan.chunk.last;
-    plan.stage3Required = plan.stage2Required;
-    plan.stage0Required = !(plan.chunk.first && !tiling.useInitialState);
-
     // 第一遍：为每个 active value head 创建一个 binding。
     for (int local = 0; local < plan.activeHvCount; ++local) {
         const int hv = plan.activeHvBegin + local;
@@ -247,6 +242,20 @@ inline RoundPlan BuildRoundPlan(const TilingPlan& tiling, int sequence, int roun
         plan.heads[local].kgSlot = slot;
     }
     // 不变量：requiredKhCount == Nkg_round <= activeHvCount <= 4。
+    return plan;
+}
+
+// 将当前 chunk 的 token 范围和 Stage 分支绑定到已经确定的 head_round 计划。
+// 这里只改变 chunk/sequence 字段，不重新计算 H_v -> H_k，也不重新分配 kg slot。
+inline RoundPlan BuildChunkPlan(const RoundPlan& headRound, const TilingPlan& tiling,
+                                const SequenceSpan& seq, int chunk)
+{
+    RoundPlan plan = headRound;
+    plan.sequence = seq.sequence;
+    plan.chunk = MakeChunk(seq, chunk);
+    plan.stage2Required = tiling.outputFinalState || !plan.chunk.last;
+    plan.stage3Required = plan.stage2Required;
+    plan.stage0Required = !(plan.chunk.first && !tiling.useInitialState);
     return plan;
 }
 

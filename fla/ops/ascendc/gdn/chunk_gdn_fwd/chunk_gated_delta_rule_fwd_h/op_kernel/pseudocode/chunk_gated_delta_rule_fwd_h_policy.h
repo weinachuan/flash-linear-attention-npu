@@ -74,9 +74,11 @@ public:
                 Wait(EventKind::kg_overwrite_safe, previousRound.kg[i].slot, /*下一 round 生产者*/ -1);
             }
         }
-        for (int i = 0; i < previousRound.activeHvCount; ++i) {
-            Wait(EventKind::WFree, previousRound.heads[i].wSlot, /*下一 round 生产者*/ -1);
-            Wait(EventKind::HFree, previousRound.heads[i].hSlot, /*下一 round 生产者*/ -1);
+        if (previousRound.stage0Required) {
+            for (int i = 0; i < previousRound.activeHvCount; ++i) {
+                Wait(EventKind::WFree, previousRound.heads[i].wSlot, /*下一 round 生产者*/ -1);
+                Wait(EventKind::HFree, previousRound.heads[i].hSlot, /*下一 round 生产者*/ -1);
+            }
         }
         Wait(EventKind::TerminalDrain, previousRound.round, /*调度器*/ -1);
     }

@@ -93,24 +93,25 @@ inline void RunFwdH(SchedulerContext& ctx)
         const auto& seq = ctx.tiling.sequences[n];
         // 循环顺序固定为：sequence -> head_round -> chunk。
         for (int round = 0; round * kMaxRoundHeads < ctx.tiling.hv; ++round) {
+            // 先固定本 head_round 的 requiredKhCount 和每个 H_v -> kgSlot 映射。
+            // 这些关系只依赖 HK/HV，与 chunk 无关；后续 chunk 只绑定 token payload。
+            const RoundPlan headRoundPlan = BuildHeadRoundPlan(ctx.tiling, round);
             if (round > 0) {
                 // 上一 round 的 kg、H、W 及异步搬运全部排空后，才允许本 round 预取。
+                const RoundPlan previousHeadRound = BuildHeadRoundPlan(ctx.tiling, round - 1);
                 const RoundPlan previousRound =
-                    BuildRoundPlan(ctx.tiling, n, round - 1, seq.chunkCount - 1);
+                    BuildChunkPlan(previousHeadRound, ctx.tiling, seq, seq.chunkCount - 1);
                 ctx.sync.WaitBeforeNextRound(previousRound);
             }
 
-            const int activeBegin = round * kMaxRoundHeads;
-            const int activeCount = static_cast<int>(ctx.tiling.hv) - activeBegin > kMaxRoundHeads
-                                        ? kMaxRoundHeads
-                                        : static_cast<int>(ctx.tiling.hv) - activeBegin;
             // S-1 是当前 round 的生产者，必须在屏障后执行，并在首个 S0 前排空。
             RunSMinusOneByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &seq,
-                                &ctx.memory, &ctx.sync, activeBegin, activeCount});
+                                &ctx.memory, &ctx.sync, headRoundPlan.activeHvBegin,
+                                headRoundPlan.activeHvCount});
 
             for (int c = 0; c < seq.chunkCount; ++c) {
-                // 每个 chunk 都重新计算 required_hk_round；kg 不能跨 round 保留。
-                const RoundPlan plan = BuildRoundPlan(ctx.tiling, n, round, c);
+                // chunk 只绑定 token 范围和最终 chunk 分支，不重新计算 required_hk_round。
+                const RoundPlan plan = BuildChunkPlan(headRoundPlan, ctx.tiling, seq, c);
                 RunOneChunk(ctx, plan);
             }
             ctx.sync.Set(EventKind::TerminalDrain, round, /*round 生产者*/ 0, /*调度器*/ -1);
