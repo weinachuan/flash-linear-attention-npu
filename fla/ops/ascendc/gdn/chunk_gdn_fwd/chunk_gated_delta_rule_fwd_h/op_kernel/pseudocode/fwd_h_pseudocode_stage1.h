@@ -1,4 +1,4 @@
-// PSEUDOCODE ONLY. Stage1: one full-head VF for V_new and optional V_new_g.
+// 仅伪代码。Stage1：每个完整 head 执行一次 VF，生成 V_new 和可选的 V_new_g。
 
 #pragma once
 
@@ -32,10 +32,10 @@ inline Stage1Result RunStage1(const Stage1Args& args)
         const HeadBinding& head = plan.heads[i];
         const bool hasP = plan.stage0Required;
         if (hasP) {
-            args.sync->Wait(EventKind::PReady, head.roundHead, /*S1*/ 1);
+            args.sync->Wait(EventKind::PReady, head.roundHead, /*S1 消费者*/ 1);
         }
 
-        // One RegBase VF covers [M,V] for this head. Tail rows are masked and zero-filled.
+        // 一个 RegBase VF 覆盖本 head 的 [M,V]；尾部行使用 mask 并补零。
         const auto p = hasP ? UbP(*args.memory, head) : ZeroP(head);
         const auto v_new_fp32 = VfSubFp32(LoadU(*args.in, plan.chunk, head.hv), p);
         const auto v_new = CastBf16(v_new_fp32);
@@ -50,20 +50,20 @@ inline Stage1Result RunStage1(const Stage1Args& args)
             const auto v_new_g = CastBf16(VfMul(v_new_fp32, GateDelta(gate, plan.chunk.validTokens, args.tiling->useExp2)));
             Mte3WriteL1Right(L1Right(args.memory->l1, head.hSlot), v_new_g);
             StoreAlpha(UbAlpha(*args.memory, head), LastGate(gate, plan.chunk.validTokens, args.tiling->useExp2));
-            args.sync->Set(EventKind::RightReady, head.hSlot, /*S1 MTE3*/ 1, /*S2*/ 2);
+            args.sync->Set(EventKind::RightReady, head.hSlot, /*S1 MTE3 生产者*/ 1, /*S2 消费者*/ 2);
             result.alphaReady = true;
         } else if (plan.gateMode == GateMode::KeyWiseGk && needsRight) {
-            // gk-only does not read gk in S1; chunk-relative decay is already in kg.
+            // gk-only 在 S1 不读取 gk；相对当前 chunk 的衰减已经包含在 kg 中。
             Mte3WriteL1Right(L1Right(args.memory->l1, head.hSlot), v_new);
-            args.sync->Set(EventKind::RightReady, head.hSlot, /*S1 MTE3*/ 1, /*S2*/ 2);
+            args.sync->Set(EventKind::RightReady, head.hSlot, /*S1 MTE3 生产者*/ 1, /*S2 消费者*/ 2);
         }
 
         if (needsRight) {
             result.rightOperandReady = true;
         }
         if (plan.chunk.first) {
-            // First h output is written with native state_v_first addressing. FP32 initial
-            // already wrote h0 in S-1, so S1 does not read it again.
+            // 第一个 h 输出使用原生 state_v_first 地址。
+            // FP32 初态已经由 S-1 写入 h0，因此 S1 不再重复读取。
             WriteH0IfNeeded(*args.in, *args.out, *args.tiling, plan, head, args.variant);
         }
         if (needsRight) {
@@ -73,4 +73,4 @@ inline Stage1Result RunStage1(const Stage1Args& args)
     return result;
 }
 
-} // namespace fwd_h_pseudocode
+} // 命名空间 fwd_h_pseudocode

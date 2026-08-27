@@ -1,4 +1,4 @@
-// PSEUDOCODE ONLY. Stage3: update rolling state and layout-aware outputs.
+// 仅伪代码。Stage3：更新 rolling state，并按布局写出结果。
 
 #pragma once
 
@@ -30,7 +30,7 @@ inline Stage3Result RunStage3(const Stage3Args& args)
 
     for (int i = 0; i < plan.activeHvCount; ++i) {
         const HeadBinding& head = plan.heads[i];
-        args.sync->Wait(EventKind::DReady, head.roundHead, /*S3*/ 3);
+        args.sync->Wait(EventKind::DReady, head.roundHead, /*S3 消费者*/ 3);
 
         const auto r = LoadRollingStateCanonical(*args.in, *args.out, *args.tiling, plan, head);
         auto rNextFp32 = ToFp32(r);
@@ -49,12 +49,12 @@ inline Stage3Result RunStage3(const Stage3Args& args)
         const auto rNext = CastState(rNextFp32, args.tiling->stateType);
         const auto hNext = CastBf16(rNext);
         if (!plan.chunk.last) {
-            // One VF produces canonical [K,V], then both GM h and L1 resident use it.
+            // 一个 VF 生成规范 [K,V]，GM h 和 L1 resident 共同使用该结果。
             args.memory->ProduceHForS3(head.hSlot);
             Mte3WriteHLayoutAware(*args.out, *args.tiling, plan, head, hNext);
             Mte3WriteL1Resident(L1H(args.memory->l1, head.hSlot), hNext);
             args.memory->MarkHReady(head.hSlot);
-            args.sync->Set(EventKind::HReady, head.hSlot, /*S3*/ 3, /*next S0*/ 0);
+            args.sync->Set(EventKind::HReady, head.hSlot, /*S3 生产者*/ 3, /*下一个 S0 消费者*/ 0);
             result.nextHReady = true;
         }
         if (plan.chunk.last && args.tiling->outputFinalState) {
@@ -62,12 +62,12 @@ inline Stage3Result RunStage3(const Stage3Args& args)
             result.finalStateWritten = true;
         }
 
-        // FP32 rolling state uses the explicit GM fallback only when a later S3 or the
-        // public final_state consumes it. No state-ready event is created for a dead value.
+        // FP32 rolling state 只有在后续 S3 或公开的 final_state 会消费时才写入 GM fallback。
+        // 对已经没有消费者的值不创建 state-ready 事件。
         StoreOrReleaseRollingState(*args.in, *args.out, *args.tiling, plan, head, rNext);
-        args.sync->Release(EventKind::DReady, head.roundHead, /*S3*/ 3);
+        args.sync->Release(EventKind::DReady, head.roundHead, /*S3 消费者*/ 3);
     }
     return result;
 }
 
-} // namespace fwd_h_pseudocode
+} // 命名空间 fwd_h_pseudocode

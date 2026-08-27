@@ -1,4 +1,4 @@
-// PSEUDOCODE ONLY. S-1: FP32 initial_state -> BF16 H0 Cube shadow.
+// 仅伪代码。S-1：FP32 initial_state -> BF16 H0 Cube shadow。
 
 #pragma once
 
@@ -28,8 +28,8 @@ inline void RunSMinusOne(const SMinusOneArgs& args)
         const int hSlot = local;
         args.memory->ProduceInitialH(hSlot);
 
-        // The only GM state layout conversion is this layout-aware read. The VF output
-        // is canonical BF16 [K,V] for S0 and is also written to logical h0.
+        // 唯一的 GM state 布局转换发生在这次 layout-aware 读取。
+        // VF 输出是供 S0 使用的规范 BF16 [K,V]，同时写入逻辑 h0。
         const auto state = Mte2ReadStateLayoutAware(
             args.in->initialState, args.sequence->sequence, hv, args.tiling->stateLayout);
         const auto h0 = CastBf16(VfCastFp32ToBf16(state));
@@ -41,4 +41,4 @@ inline void RunSMinusOne(const SMinusOneArgs& args)
     WaitInitialPhaseDrain(*args.sync, args.sequence->sequence);
 }
 
-} // namespace fwd_h_pseudocode
+} // 命名空间 fwd_h_pseudocode

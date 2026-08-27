@@ -1,5 +1,5 @@
-// PSEUDOCODE ONLY. This file is an implementation blueprint and is not compiled.
-// The directory mirrors the PR370 FwdH layout; no PR370 kernel logic is reused.
+// 仅伪代码。本文件是实现蓝图，不参与编译。
+// 目录结构参考 PR370 的 FwdH 布局，但不复用 PR370 的 kernel 逻辑。
 
 #pragma once
 
@@ -38,10 +38,10 @@ struct TensorRef {
 };
 
 struct ApiInputs {
-    TensorRef k;       // g-only: raw [B, HK, T, K]; gk-only: prepared kg [B, HV, T, K]
+    TensorRef k;       // g-only：raw [B, HK, T, K]；gk-only：prepared kg [B, HV, T, K]
     TensorRef w;       // [B, HV, T, K]
     TensorRef u;       // [B, HV, T, V]
-    TensorRef g;       // g-only [B, HV, T], represented by d3 == 0
+    TensorRef g;       // g-only [B, HV, T]，用 d3 == 0 表示
     TensorRef gk;      // gk-only [B, HV, T, K]
     TensorRef initialState;
     TensorRef finalState;
@@ -57,12 +57,12 @@ struct ApiInputs {
 };
 
 struct ApiOutputs {
-    TensorRef h;          // [B, HV, Ctot, K, V] or [B, HV, Ctot, V, K]
+    TensorRef h;          // [B, HV, Ctot, K, V] 或 [B, HV, Ctot, V, K]
     TensorRef v_new;      // [B, HV, T, V]
-    TensorRef finalState; // [N, HV, K, V] or [N, HV, V, K]
+    TensorRef finalState; // [N, HV, K, V] 或 [N, HV, V, K]
 };
 
-// Framework-facing names used only by the fast-launch-shaped pseudocode entry.
+// 仅供 fast-launch 形状伪代码入口使用的框架侧名称。
 using PseudocodeTensor = TensorRef;
 using OptionalPseudocodeTensor = TensorRef;
 struct OptionalIntArray {
@@ -88,18 +88,18 @@ struct ChunkSpan {
     int chunk = 0;
     int globalChunk = 0;
     int64_t tokenBegin = 0;
-    int64_t validTokens = 0; // M, always 1 <= M <= 64 after host validation
+    int64_t validTokens = 0; // M；经过 Host 校验后始终满足 1 <= M <= 64
     bool first = false;
     bool last = false;
 };
 
 struct HeadBinding {
-    int roundHead = -1; // 0..activeHeadCount-1, local to this round
+    int roundHead = -1; // 0..activeHeadCount-1，仅在本 round 内有效
     int hv = -1;
-    int kh = -1;        // g-only: hk; gk-only: hv
-    int kgSlot = -1;    // slot in the current round's kg slot table
-    int hSlot = -1;     // L1[128,256), one resident per value head
-    int wSlot = -1;     // L1[0,64), one W per value head
+    int kh = -1;        // g-only：hk；gk-only：hv
+    int kgSlot = -1;    // 当前 round 的 kg slot 表中的 slot
+    int hSlot = -1;     // L1[128,256)，每个 value head 一个 resident
+    int wSlot = -1;     // L1[0,64)，每个 value head 一个 W
     int aiv = -1;       // roundHead % 2
     int localSlot = -1; // roundHead / 2
     bool active = false;
@@ -153,11 +153,11 @@ struct TilingPlan {
 };
 
 struct L1SlotTable {
-    // Address units are KiB and are fixed for the whole dispatch.
-    int wBaseKiB = 0;       // [0, 64): 4 x 16 KiB W slots
-    int hBaseKiB = 128;     // [128, 256): 4 x 32 KiB H slots
-    int kgBaseKiB = 256;    // [256, 320): 4 x 16 KiB kg slots
-    int rightBaseKiB = 128; // S1 reuses an H slot only after its S0 read is free
+    // 地址单位为 KiB，在整个 dispatch 期间固定不变。
+    int wBaseKiB = 0;       // [0, 64)：4 个 16 KiB W slot
+    int hBaseKiB = 128;     // [128, 256)：4 个 32 KiB H slot
+    int kgBaseKiB = 256;    // [256, 320)：4 个 16 KiB kg slot
+    int rightBaseKiB = 128; // S0 读取释放后，S1 才能复用 H slot
 };
 
 struct UbSlotTable {
@@ -183,8 +183,8 @@ struct SlotEvents {
 
 inline int64_t state_gm_offset(int64_t base, int64_t k, int64_t v, bool stateVFirst)
 {
-    // Internal L1/UB is always canonical [K,V]; only GM state order changes.
+    // 内部 L1/UB 始终使用规范 [K,V]；只有 GM state 的顺序会变化。
     return base + (stateVFirst ? v * kValueDim + k : k * kValueDim + v);
 }
 
-} // namespace fwd_h_pseudocode
+} // 命名空间 fwd_h_pseudocode

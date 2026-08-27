@@ -1,4 +1,4 @@
-// PSEUDOCODE ONLY. Event/flag ledger for intra-core and cross-core handoff.
+// 仅伪代码。核内与核间交接使用的事件/flag 台账。
 
 #pragma once
 
@@ -34,7 +34,7 @@ class SyncLedger {
 public:
     void Set(EventKind kind, int slot, int producer, int consumer)
     {
-        // Set only after the producer pipe has completed its write. Every Set has one Wait.
+        // 只有生产者 pipe 完成写入后才能 Set；每个 Set 都必须有一个对应的 Wait。
         if (recordCount_ < static_cast<int>(records_.size())) {
             records_[recordCount_++] = {kind, slot, producer, consumer, NewToken()};
         }
@@ -42,7 +42,7 @@ public:
 
     void Wait(EventKind kind, int slot, int consumer)
     {
-        // Wait uses the matching generation and pipe pair; no token is reset by hand.
+        // Wait 必须使用匹配的 generation 和 pipe 对，禁止手工重置 token。
         (void)kind;
         (void)slot;
         (void)consumer;
@@ -50,7 +50,7 @@ public:
 
     void Release(EventKind kind, int slot, int consumer)
     {
-        // A free/overwrite-safe event is emitted only after the last read by this consumer.
+        // 只有当前消费者完成最后一次读取后，才能发出 free/overwrite-safe 事件。
         (void)kind;
         (void)slot;
         (void)consumer;
@@ -58,18 +58,18 @@ public:
 
     void WaitBeforeNextRound(const RoundPlan& previousRound)
     {
-        // This is the mandatory cross-round barrier. It is called before any next-round
-        // H/W/kg prefetch, even when the same kh appears again.
+        // 这是强制的跨 round 屏障。即使下一 round 再次出现相同 kh，
+        // 也必须在任何 H/W/kg 预取之前调用它。
         if (previousRound.stage2Required) {
             for (int i = 0; i < previousRound.requiredKhCount; ++i) {
-                Wait(EventKind::kg_overwrite_safe, previousRound.kg[i].slot, /*next round producer*/ -1);
+                Wait(EventKind::kg_overwrite_safe, previousRound.kg[i].slot, /*下一 round 生产者*/ -1);
             }
         }
         for (int i = 0; i < previousRound.activeHvCount; ++i) {
-            Wait(EventKind::WFree, previousRound.heads[i].wSlot, /*next round producer*/ -1);
-            Wait(EventKind::HFree, previousRound.heads[i].hSlot, /*next round producer*/ -1);
+            Wait(EventKind::WFree, previousRound.heads[i].wSlot, /*下一 round 生产者*/ -1);
+            Wait(EventKind::HFree, previousRound.heads[i].hSlot, /*下一 round 生产者*/ -1);
         }
-        Wait(EventKind::TerminalDrain, previousRound.round, /*scheduler*/ -1);
+        Wait(EventKind::TerminalDrain, previousRound.round, /*调度器*/ -1);
     }
 
 private:
@@ -83,4 +83,4 @@ private:
     uint64_t nextGeneration_ = 1;
 };
 
-} // namespace fwd_h_pseudocode
+} // 命名空间 fwd_h_pseudocode

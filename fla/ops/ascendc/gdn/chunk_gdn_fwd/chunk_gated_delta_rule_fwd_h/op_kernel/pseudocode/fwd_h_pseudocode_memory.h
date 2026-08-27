@@ -1,4 +1,4 @@
-// PSEUDOCODE ONLY. Fixed L1/UB addresses and owner transitions.
+// 仅伪代码。固定的 L1/UB 地址与所有权状态转换。
 
 #pragma once
 
@@ -23,21 +23,21 @@ public:
 
     void AcquireHForS0(int hSlot)
     {
-        // H resident is [128, 256), 32 KiB per value head. It is either initial GM,
-        // S-1 output, or previous S3 output; no mixed owner is allowed.
+        // H resident 位于 [128, 256)，每个 value head 占 32 KiB。
+        // 它的来源只能是 initial GM、S-1 输出或前一个 S3 输出，禁止混合所有者。
         RequireFree(h[hSlot]);
         h[hSlot].state = SlotState::Loading;
     }
 
     void BeginHReadFromS3(int hSlot)
     {
-        // S3 has already produced this resident and published HReady.
+        // S3 已经生成该 resident，并发布 HReady。
         Require(h[hSlot].state == SlotState::Ready);
     }
 
     void ProduceHForS3(int hSlot)
     {
-        // The previous S0/S2 owner must have released both aliases before S3 writes Hnext.
+        // S3 写入 Hnext 前，前一个 S0/S2 所有者必须释放两个别名。
         RequireFree(h[hSlot]);
         RequireFree(right[hSlot]);
         h[hSlot].state = SlotState::Loading;
@@ -45,7 +45,7 @@ public:
 
     void ProduceInitialH(int hSlot)
     {
-        // S-1 is a producer equivalent to S3, but only for the current head round.
+        // S-1 的生产语义等价于 S3，但只服务当前 head round。
         ProduceHForS3(hSlot);
     }
 
@@ -58,7 +58,7 @@ public:
 
     void AcquireRightForS1(int hSlot)
     {
-        // S1 reuses the same physical H slot only after S0's MTE1 has released it.
+        // 只有 S0 的 MTE1 释放物理 H slot 后，S1 才能复用该 slot。
         RequireFree(right[hSlot]);
         right[hSlot].state = SlotState::Loading;
     }
@@ -77,10 +77,10 @@ public:
 private:
     static void Require(bool condition)
     {
-        // Pseudocode assertion: real kernel uses the event protocol, not a user-input static_assert.
+        // 伪代码断言：真实 kernel 使用事件协议，而不是对用户输入做 static_assert。
         (void)condition;
     }
     static void RequireFree(const MemoryTicket& ticket) { Require(ticket.state == SlotState::Free); }
 };
 
-} // namespace fwd_h_pseudocode
+} // 命名空间 fwd_h_pseudocode

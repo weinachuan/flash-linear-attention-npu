@@ -1,4 +1,4 @@
-// PSEUDOCODE ONLY. Sequence -> head_round -> chunk scheduler and cross-round lifetime.
+// 仅伪代码。sequence -> head_round -> chunk 调度，以及跨 round 生命周期管理。
 
 #pragma once
 
@@ -34,7 +34,7 @@ inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan)
     RunStage1({&ctx.inputs, &ctx.outputs, &ctx.tiling, &plan, &ctx.memory, &ctx.sync, variant});
 
     if (!plan.stage2Required) {
-        // No kg prefetch, S2 MMAD, or S3 state materialization when final_state is not requested.
+        // 未请求 final_state 时，不预取 kg、不执行 S2 MMAD，也不在 S3 落盘 state。
         return;
     }
     RunStage2({&ctx.inputs, &ctx.tiling, &plan, &ctx.memory, &ctx.sync});
@@ -43,16 +43,16 @@ inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan)
 
 inline void RunFwdH(SchedulerContext& ctx)
 {
-    // Host validation has already established all shape/dtype/layout invariants.
+    // Host 校验已经建立全部 shape/dtype/layout 不变量。
     for (int n = 0; n < ctx.tiling.sequenceCount; ++n) {
         const auto& seq = ctx.tiling.sequences[n];
-        // The loop order is mandatory: sequence -> head_round -> chunk.
+        // 循环顺序固定为：sequence -> head_round -> chunk。
         for (int round = 0; round * kMaxRoundHeads < ctx.tiling.hv; ++round) {
             RoundPlan previousRound{};
             bool hasPreviousRound = round > 0;
             if (hasPreviousRound) {
-                // Wait for every kg/H/W slot and all asynchronous transfers from the previous
-                // round before this round is allowed to prefetch any H/W/kg.
+                // 必须等待前一个 round 的所有 kg/H/W slot 和异步搬运完成，
+                // 本 round 才允许预取任何 H/W/kg。
                 previousRound = BuildRoundPlan(ctx.tiling, n, round - 1, seq.chunkCount - 1);
                 ctx.sync.WaitBeforeNextRound(previousRound);
             }
@@ -61,21 +61,21 @@ inline void RunFwdH(SchedulerContext& ctx)
             const int activeCount = static_cast<int>(ctx.tiling.hv) - activeBegin > kMaxRoundHeads
                                         ? kMaxRoundHeads
                                         : static_cast<int>(ctx.tiling.hv) - activeBegin;
-            // S-1 is a current-round producer. It must be after the previous-round barrier,
-            // and it must drain before this round's first S0 consumes H.
+            // S-1 是当前 round 的生产者，必须在上一 round 屏障之后执行，
+            // 并在本 round 的第一个 S0 消费 H 之前完成排空。
             RunSMinusOne({&ctx.inputs, &ctx.outputs, &ctx.tiling, &seq, &ctx.memory, &ctx.sync,
                           activeBegin, activeCount});
 
             for (int c = 0; c < seq.chunkCount; ++c) {
-                // kg slot payload is keyed by (chunk, kh) and is current-round only. If a
-                // slot was used by the previous chunk, Stage0/Stage2 waits its overwrite-safe
-                // event before reusing the fixed 16 KiB address.
+                // kg slot 的 payload 由 (chunk, kh) 标识，只属于当前 round。
+                // 如果 slot 被前一个 chunk 使用过，Stage0/Stage2 必须先等待覆盖安全事件，
+                // 再复用固定的 16 KiB 地址。
                 const RoundPlan plan = BuildRoundPlan(ctx.tiling, n, round, c);
                 RunOneChunk(ctx, plan);
             }
-            ctx.sync.Set(EventKind::TerminalDrain, round, /*round producer*/ 0, /*scheduler*/ -1);
+            ctx.sync.Set(EventKind::TerminalDrain, round, /*round 生产者*/ 0, /*调度器*/ -1);
         }
     }
 }
 
-} // namespace fwd_h_pseudocode
+} // 命名空间 fwd_h_pseudocode

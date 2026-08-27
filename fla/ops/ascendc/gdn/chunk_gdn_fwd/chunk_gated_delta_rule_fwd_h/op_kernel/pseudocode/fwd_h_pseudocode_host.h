@@ -1,4 +1,4 @@
-// PSEUDOCODE ONLY. Host validation and tiling contract.
+// 仅伪代码。Host 侧参数校验与 tiling 契约。
 
 #pragma once
 
@@ -38,43 +38,43 @@ inline HostResult ValidateAndBuildTiling(const ApiInputs& in)
 {
     HostResult result{};
 
-    // Presence checks happen before any dtype inference or GM dereference.
+    // 先检查输入是否存在，再进行 dtype 推导或 GM 解引用。
     const bool hasG = in.g.present;
     const bool hasGk = in.gk.present;
     if (hasG == hasGk) {
-        result.error = "exactly one of g and gk must be present";
+        result.error = "g 和 gk 必须且只能提供一个";
         return result;
     }
     if (!in.k.present || !in.w.present || !in.u.present) {
-        result.error = "k, w and u are required";
+        result.error = "k、w、u 为必选输入";
         return result;
     }
     if (!in.saveNewValue || in.chunkSize != kBatchTokens) {
-        result.error = "only save_new_value=true and chunk_size=64 are supported";
+        result.error = "仅支持 save_new_value=true 且 chunk_size=64";
         return result;
     }
     if (in.outputFinalState != in.finalState.present) {
-        result.error = "output_final_state must match final_state presence";
+        result.error = "output_final_state 必须与 final_state 是否存在一致";
         return result;
     }
     if (!ValidateStateShape(in.initialState, in.stateVFirst) ||
         !ValidateStateShape(in.finalState, in.stateVFirst)) {
-        result.error = "state shape does not match state_v_first";
+        result.error = "state 形状与 state_v_first 不匹配";
         return result;
     }
     if (in.initialState.present && in.finalState.present &&
         in.initialState.dtype != in.finalState.dtype) {
-        result.error = "initial_state and final_state must have the same dtype";
+        result.error = "initial_state 和 final_state 的 dtype 必须一致";
         return result;
     }
     if (in.k.dtype != StateType::Bf16 || in.w.dtype != StateType::Bf16 ||
         in.u.dtype != StateType::Bf16) {
-        result.error = "k, w and u must be BF16";
+        result.error = "k、w、u 必须为 BF16";
         return result;
     }
     if (in.k.shape.d3 != kKeyDim || in.u.shape.d3 != kValueDim ||
         in.w.shape.d3 != kKeyDim) {
-        result.error = "K and V must both be 128";
+        result.error = "K 和 V 必须均为 128";
         return result;
     }
 
@@ -82,22 +82,22 @@ inline HostResult ValidateAndBuildTiling(const ApiInputs& in)
     const int64_t hv = in.u.shape.d1;
     if (in.w.shape.d1 != hv || in.g.present && in.g.shape.d1 != hv ||
         in.gk.present && in.gk.shape.d1 != hv) {
-        result.error = "w, gate and u value-head dimensions must match";
+        result.error = "w、gate、u 的 value-head 维度必须一致";
         return result;
     }
     if (hasG && (hv <= 0 || hk <= 0 || hv % hk != 0)) {
-        result.error = "g-only requires HV % HK == 0";
+        result.error = "g-only 要求 HV % HK == 0";
         return result;
     }
     if (hasGk && hk != hv) {
-        result.error = "gk-only k is prepared kg and must have HV heads";
+        result.error = "gk-only 的 k 已是按 value head 展开的 kg，必须有 HV 个 head";
         return result;
     }
 
     const bool hasCu = in.cuSeqlens != nullptr;
     const bool hasIndices = in.chunkIndices != nullptr;
     if (hasCu != hasIndices) {
-        result.error = "cu_seqlens and chunk_indices must be provided together";
+        result.error = "cu_seqlens 和 chunk_indices 必须同时提供";
         return result;
     }
 
@@ -113,8 +113,8 @@ inline HostResult ValidateAndBuildTiling(const ApiInputs& in)
     result.tiling.useInitialState = in.initialState.present;
     result.tiling.useExp2 = in.useExp2;
 
-    // Build sequence spans. The real host implementation also validates chunk_indices
-    // are exactly the compact [sequence, chunk] order implied by these spans.
+    // 构造 sequence span。真实 Host 实现还需要校验 chunk_indices 是否严格按照
+    // 这些 span 推导出的紧凑 [sequence, chunk] 顺序排列。
     if (!hasCu) {
         result.tiling.sequenceCount = in.k.shape.d0;
         for (int n = 0; n < result.tiling.sequenceCount; ++n) {
@@ -129,7 +129,7 @@ inline HostResult ValidateAndBuildTiling(const ApiInputs& in)
         }
     } else {
         if (in.k.shape.d0 != 1 || in.cuSeqlensLength < 2) {
-            result.error = "varlen requires B=1 and at least [0,T]";
+            result.error = "varlen 要求 B=1 且至少提供 [0,T]";
             return result;
         }
         result.tiling.sequenceCount = in.cuSeqlensLength - 1;
@@ -137,7 +137,7 @@ inline HostResult ValidateAndBuildTiling(const ApiInputs& in)
             const int64_t begin = in.cuSeqlens[n];
             const int64_t end = in.cuSeqlens[n + 1];
             if (end <= begin) {
-                result.error = "varlen sequences must be non-empty";
+                result.error = "varlen 序列不能为空";
                 return result;
             }
             auto& seq = result.tiling.sequences[n];
@@ -151,7 +151,7 @@ inline HostResult ValidateAndBuildTiling(const ApiInputs& in)
         }
     }
 
-    // Output allocation is shown symbolically; the real meta function supplies tensors.
+    // 这里只符号化表示输出分配；真实 meta 函数负责提供 tensor。
     result.outputs.h.shape = {in.k.shape.d0, hv, result.tiling.totalChunks,
                               in.stateVFirst ? kValueDim : kKeyDim,
                               in.stateVFirst ? kKeyDim : kValueDim};
@@ -165,4 +165,4 @@ inline HostResult ValidateAndBuildTiling(const ApiInputs& in)
     return result;
 }
 
-} // namespace fwd_h_pseudocode
+} // 命名空间 fwd_h_pseudocode

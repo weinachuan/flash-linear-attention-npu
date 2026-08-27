@@ -1,4 +1,4 @@
-// PSEUDOCODE ONLY. Exact GVA round and head-to-key binding.
+// 仅伪代码。精确的 GVA round 规划与 head 到 key 的绑定。
 
 #pragma once
 
@@ -9,7 +9,7 @@ namespace fwd_h_pseudocode {
 inline int HvToKh(int hv, int hk, int valueHeads, GateMode mode)
 {
     if (mode == GateMode::KeyWiseGk) {
-        return hv; // gk input is already expanded/prepared per value head.
+        return hv; // gk 输入已经按 value head 展开并准备为 kg。
     }
     const int groupSize = valueHeads / hk;
     return hv / groupSize;
@@ -49,7 +49,7 @@ inline RoundPlan BuildRoundPlan(const TilingPlan& tiling, int sequence, int roun
     plan.stage3Required = plan.stage2Required;
     plan.stage0Required = !(plan.chunk.first && !tiling.useInitialState);
 
-    // First pass: create one binding per active value head.
+    // 第一遍：为每个 active value head 创建一个 binding。
     for (int local = 0; local < plan.activeHvCount; ++local) {
         const int hv = plan.activeHvBegin + local;
         auto& binding = plan.heads[local];
@@ -63,8 +63,8 @@ inline RoundPlan BuildRoundPlan(const TilingPlan& tiling, int sequence, int roun
         binding.active = true;
     }
 
-    // Second pass: unique required key heads in first-seen order. This is the only
-    // place where kg slot count is decided; it is never sized by whole-sequence HK/HV.
+    // 第二遍：按首次出现顺序收集不重复的 required key head。
+    // 只有这里决定 kg slot 数量，不能按整段 sequence 的 HK/HV 预留。
     for (int local = 0; local < plan.activeHvCount; ++local) {
         const int kh = plan.heads[local].kh;
         int slot = -1;
@@ -87,8 +87,8 @@ inline RoundPlan BuildRoundPlan(const TilingPlan& tiling, int sequence, int roun
         }
         plan.heads[local].kgSlot = slot;
     }
-    // Invariant: requiredKhCount == Nkg_round <= activeHvCount <= 4.
+    // 不变量：requiredKhCount == Nkg_round <= activeHvCount <= 4。
     return plan;
 }
 
-} // namespace fwd_h_pseudocode
+} // 命名空间 fwd_h_pseudocode
