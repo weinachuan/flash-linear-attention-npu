@@ -179,15 +179,21 @@ inline void Stage2EnsureKgReady(const CubeStage2Args& args, const kg_binding& bi
                    /*S2 MTE1*/ 2);
 }
 
-inline void Stage2LoadRightToL1Nz(const CubeStage2Args& args, const HeadBinding& head)
+inline void Stage2PrefetchRightToL1Nz(const CubeStage2Args& args, const HeadBinding& head)
 {
     const int rightGmSlot = head.roundHead;
-    // Stage1 已经把 UB ND 写入 GM；先等 GM 写出，再由 Stage2 MTE2 完成 ND -> NZ 的落 L1。
+    // Stage1 已经把 UB ND 写入 GM；先等 GM 写出，再异步发起 Stage2 的 ND -> NZ 搬运。
     args.sync->Wait(EventKind::RightGmReady, rightGmSlot, /*S2 MTE2*/ 0);
     args.memory->AcquireRightForS2Mte2(head.hSlot);
     Mte2CopyRightOperandGmNdToL1NzAsync(
         args.workspace->rightOperandGm, rightGmSlot, args.plan->chunk,
         L1Right(args.memory->l1, head.hSlot), args.plan->chunk.validTokens);
+}
+
+inline void Stage2EnsureRightL1Ready(const CubeStage2Args& args, const HeadBinding& head)
+{
+    const int rightGmSlot = head.roundHead;
+    // 预取已经发起；每个 head 的 MTE1 只在本 head 的 L1 NZ 完成后继续。
     wait_mte2_right_l1_done(head.hSlot);
     args.memory->MarkRightL1Ready(head.hSlot);
     // GM scratch 在 MTE2 完成后已经没有消费者，允许下一 chunk/round 的 Stage1 复用。
@@ -207,8 +213,8 @@ inline void Stage2ComputeDForHead(const CubeStage2Args& args, const HeadBinding&
     if (head.roundHead == binding.firstConsumerRoundHead) {
         args.sync->Wait(EventKind::kg_ready, binding.slot, /*S2 MTE1*/ 2);
     }
-    // 子模块 Stage2LoadRightToL1Nz：S1 的 GM ND 已就绪后，再搬为 L1 NZ。
-    Stage2LoadRightToL1Nz(args, head);
+    // 子模块 Stage2EnsureRightL1Ready：确认预取的 GM ND -> L1 NZ 已完成。
+    Stage2EnsureRightL1Ready(args, head);
     // L1 NZ 已经由本 head 的 Stage2 MTE2 生成，之后才允许 MTE1 读右操作数。
     args.sync->Wait(EventKind::RightL1Ready, head.hSlot, /*S2 MTE1*/ 2);
     const auto& localData = args.memory->localData[FixedMemory::LocalBank(head)];
@@ -253,6 +259,10 @@ inline CubeStageResult RunStage2Arch22(const CubeStage2Args& args)
     }
 
     Stage2LoadKgForRound(args);
+    // 先为本 round 的所有 value head 发起右操作数预取；后续每个 head 在 MTE1 前确认就绪。
+    for (int i = 0; i < plan.activeHvCount; ++i) {
+        Stage2PrefetchRightToL1Nz(args, plan.heads[i]);
+    }
     // 每个 active value head 执行一次完整逻辑转置 MMAD；共享 kh 的 head 共享 L1 kg slot。
     for (int i = 0; i < plan.activeHvCount; ++i) {
         Stage2ComputeDForHead(args, plan.heads[i]);

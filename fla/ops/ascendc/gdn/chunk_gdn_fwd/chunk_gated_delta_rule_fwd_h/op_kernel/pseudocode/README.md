@@ -87,7 +87,8 @@ ND 搬成 L1 NZ，不能走 UB -> L1 直通路径，否则一次搬运会被拆�
 | --- | --- | --- | --- | --- |
 | `Stage2LoadKgForRound` | 当前 `requiredKh[]` 的 `(chunk, kh)` | 当前 round 的 `kg`/`k_raw` payload | L1 kg slot `[256,320)` 的 `Nkg_round` 个 slot | 等上一代 `kg_overwrite_safe` 后 acquire；MTE2 发起后交给首个消费者等待 |
 | `Stage2EnsureKgReady` | 当前 `kg_binding` | valid `kg[M,K]` | L1 kg slot `[256,320)` | 等待本 Stage2 MTE2 完成并发布 `kg_ready`；后续 mapped head 直接复用 |
-| `Stage2LoadRightToL1Nz` | 私有 GM ND right scratch | L1 NZ 右操作数 | 对应 H slot `[128,256)`；Stage2 才 acquire | `RightGmReady -> MTE2 -> RightL1Ready`；GM 读完后 `RightGmFree` |
+| `Stage2PrefetchRightToL1Nz` | 私有 GM ND right scratch | 异步发起 L1 NZ 右操作数搬运 | 对应 H slot `[128,256)`；Stage2 才 acquire | `RightGmReady -> MTE2` |
+| `Stage2EnsureRightL1Ready` | 已发起的 GM ND -> L1 NZ 搬运 | L1 NZ 右操作数就绪 | 对应 H slot `[128,256)` | MTE2 完成后 `RightL1Ready`、`RightGmFree` |
 | `Stage2WaitRightL1AndAcquireD` | L1 NZ 右操作数、P/D local data owner | D owner | UB local data bank `[0,128)` | `RightL1Ready` 和前一 owner `PFree/DFree` |
 | `Stage2ComputeDForHead` | g-only `k_raw + V_new_g` 或 gk-only `kg + V_new` | FP32 `D` | L0A/L0B；Fixpipe 到 UB D 区 `[0,128)` | 首个 mapped head 等 `kg_ready`；`MMAD -> NoQuant Fixpipe -> DReady` |
 | `Stage2ReleaseInputs` | 本次 MTE1 读取完成 | 释放 right/kg | L1 right 与 kg slot | right 最后消费者 `RightFree`；kg 最后消费者 `kg_overwrite_safe` |
@@ -225,9 +226,10 @@ GM scratch 只保存当前 chunk 的 ND 右操作数，S2 MTE2 完成后通过 `
 
     如果 plan.stage2Required：
         S2.LoadKgForRound(requiredKh[])         # 仅在 S2 入口搬运当前 chunk 的 distinct kg
+        对每个 active head：异步发起 GM ND -> L1 NZ 的 right 预取
         对每个 active head：
             确保其 kg slot valid；首个 mapped head 等待本 Stage2 的 MTE2
-            等待 RightGmReady；MTE2 将 GM ND 转成 L1 NZ，发布 RightL1Ready
+            确认预取的 GM ND -> L1 NZ 已完成，发布 RightL1Ready/RightGmFree
             等待 RightL1Ready 和 local data free
             MTE1(kg,right) -> MMAD -> NoQuant Fixpipe(D)
             发布 DReady；最后一个 mapped head 释放 kg_overwrite_safe
