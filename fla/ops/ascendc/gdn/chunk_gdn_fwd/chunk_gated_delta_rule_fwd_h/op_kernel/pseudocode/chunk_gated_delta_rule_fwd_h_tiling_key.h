@@ -64,6 +64,12 @@ struct ApiOutputs {
     TensorRef finalState; // [N, HV, K, V] 或 [N, HV, V, K]
 };
 
+struct WorkspaceRefs {
+    // 右操作数的私有 GM scratch。Stage1 写入 ND，Stage2 再搬成 L1 NZ；
+    // 每个 head_round slot 只保存当前 chunk，GM 搬入 L1 后立即归还。
+    TensorRef rightOperandGm;
+};
+
 // 仅供 fast-launch 形状伪代码入口使用的框架侧名称。
 using PseudocodeTensor = TensorRef;
 using OptionalPseudocodeTensor = TensorRef;
@@ -181,6 +187,7 @@ struct HostResult {
     bool ok = false;
     TilingPlan tiling{};
     ApiOutputs outputs{};
+    WorkspaceRefs workspace{};
     const char* error = nullptr;
 };
 

@@ -11,6 +11,7 @@ namespace fwd_h_pseudocode {
 struct VecStageArgs {
     const ApiInputs* in = nullptr;
     const ApiOutputs* out = nullptr;
+    WorkspaceRefs* workspace = nullptr;
     const TilingPlan* tiling = nullptr;
     const RoundPlan* plan = nullptr;
     FixedMemory* memory = nullptr;
@@ -40,7 +41,7 @@ struct SMinusOneArgs {
 };
 
 struct VecStageResult {
-    bool rightOperandReady = false;
+    bool rightGmReady = false;
     bool alphaReady = false;
     bool nextHReady = false;
     bool finalStateWritten = false;
@@ -80,9 +81,8 @@ inline void SMinusOneConvertAndWriteH0(const SMinusOneArgs& args, const HeadBind
     args.memory->ReleaseInitialInput(head);
     args.sync->Release(EventKind::InitialInputFree, bank, /*S-1 VF*/ 1);
 
-    // 同一份 h0 同时写公开 h0 和 L1 resident；两路 MTE3 完成前不能释放输出 bank。
+    // H0 只写公开 GM 的 layout-aware 形式；S0 随后用 MTE2 搬成 L1 NZ，避免 UB -> L1 直通。
     Mte3WriteH0LayoutAwareAsync(*args.out, *args.tiling, *args.sequence, head.hv, h0);
-    Mte3WriteL1ResidentAsync(L1H(args.memory->l1, head.hSlot), h0);
     wait_mte3_h0_done(bank);
     args.memory->MarkHReady(head.hSlot);
     args.memory->MarkInitialHOutputReady(head);
@@ -106,11 +106,11 @@ inline void RunSMinusOneArch22(const SMinusOneArgs& args)
         SMinusOneConvertAndWriteH0(args, head);
     }
 
-    // 所有 active head 的初态输入/H0 两路搬运都 drain 后，才统一向 AIC 发布 HReady。
+    // 所有 active head 的初态输入/H0 GM 搬运都 drain 后，才统一向 AIC 发布 HGmReady。
     args.sync->Set(EventKind::InitialPhaseDrain, args.sequence->sequence,
                    /*S-1 MTE3*/ 1, /*调度器*/ -1);
     for (int local = 0; local < args.activeHvCount; ++local) {
-        args.sync->Set(EventKind::HReady, local, /*S-1 phase*/ 1, /*S0 MTE1*/ 1);
+        args.sync->Set(EventKind::HGmReady, local, /*S-1 phase*/ 1, /*S0 MTE2*/ 0);
         args.memory->ReleaseInitialHOutput(
             HeadBinding{local, args.activeHvBegin + local, -1, -1, local,
                         local, local % kAivCount, local / kAivCount, true});
@@ -227,34 +227,45 @@ inline void Stage1ComputeAndWriteVNew(const VecStageArgs& args, const HeadBindin
     write_v_new_from_ub(*args.out, plan.chunk, head.hv,
                         UbVNewWork(*args.memory, head, args.tiling->stateType), vNew);
 
-    // 子模块 Stage1WriteRightOperand：仅在确有 S2 消费者时，把右操作数写入 L1 zN。
+    // 子模块 Stage1WriteRightOperandToGm：UB 中是 ND，先写入每个 roundHead
+    // 对应的 GM scratch；这里禁止 UB -> L1，因为该路径不能一次完成 ND -> NZ。
     if (plan.gateMode == GateMode::ScalarG && plan.stage2Required) {
         // g-only：同一次 VF 从 V_new_fp32 派生 V_new_g 和 alpha，避免重复读 u/P/g。
         const auto gate = UbGate(*args.memory, head);
         const auto vNewG = CastBf16(
             VfMulFull(vNewFp32, GateDeltaFromUb(gate, plan.chunk.validTokens,
                                                 args.tiling->useExp2)));
-        args.memory->AcquireRightForS1(head.hSlot);
-        Mte3WriteL1RightZnAsync(L1Right(args.memory->l1, head.hSlot), vNewG,
-                                plan.chunk.validTokens);
+        const int rightSlot = head.roundHead;
+        if (args.memory->rightGm[rightSlot].generation > 0 && !plan.roundBoundaryDrained) {
+            args.sync->Wait(EventKind::RightGmFree, rightSlot, /*下一 chunk S1 MTE3*/ 1);
+        }
+        args.memory->AcquireRightGmForS1(rightSlot);
+        Mte3WriteRightOperandGmNdAsync(
+            args.workspace->rightOperandGm, rightSlot, plan.chunk,
+            vNewG, plan.chunk.validTokens);
         StoreAlpha(UbAlpha(*args.memory, head),
                    LastGateFromUb(gate, plan.chunk.validTokens, args.tiling->useExp2));
-        wait_mte3_right_done(head.hSlot);
-        args.memory->MarkRightReady(head.hSlot);
-        args.sync->Set(EventKind::RightReady, head.hSlot, /*S1 MTE3*/ 1,
-                       /*S2 MTE1*/ 2);
+        wait_mte3_right_gm_done(rightSlot);
+        args.memory->MarkRightGmReady(rightSlot);
+        args.sync->Set(EventKind::RightGmReady, rightSlot, /*S1 MTE3*/ 1,
+                       /*S2 MTE2*/ 0);
     } else if (plan.gateMode == GateMode::KeyWiseGk && plan.stage2Required) {
         // gk-only：相对衰减已经吸收到输入 kg，S1 不搬 gk、不生成 V_new_g。
-        args.memory->AcquireRightForS1(head.hSlot);
-        Mte3WriteL1RightZnAsync(L1Right(args.memory->l1, head.hSlot), vNew,
-                                plan.chunk.validTokens);
-        wait_mte3_right_done(head.hSlot);
-        args.memory->MarkRightReady(head.hSlot);
-        args.sync->Set(EventKind::RightReady, head.hSlot, /*S1 MTE3*/ 1,
-                       /*S2 MTE1*/ 2);
+        const int rightSlot = head.roundHead;
+        if (args.memory->rightGm[rightSlot].generation > 0 && !plan.roundBoundaryDrained) {
+            args.sync->Wait(EventKind::RightGmFree, rightSlot, /*下一 chunk S1 MTE3*/ 1);
+        }
+        args.memory->AcquireRightGmForS1(rightSlot);
+        Mte3WriteRightOperandGmNdAsync(
+            args.workspace->rightOperandGm, rightSlot, plan.chunk,
+            vNew, plan.chunk.validTokens);
+        wait_mte3_right_gm_done(rightSlot);
+        args.memory->MarkRightGmReady(rightSlot);
+        args.sync->Set(EventKind::RightGmReady, rightSlot, /*S1 MTE3*/ 1,
+                       /*S2 MTE2*/ 0);
     }
 
-    // P 的最后一次读取在 VF 内完成；g-only 还要等 V_new_g MTE3，RightReady 才能继续 S2。
+    // P 的最后一次读取在 VF 内完成；右操作数先落 GM，S2 再负责 GM -> L1 NZ。
     if (hasP) {
         VfLastReadP(head);
         args.memory->ReleasePAfterS1(head);
@@ -280,7 +291,8 @@ inline void Stage1WriteH0IfNeeded(const VecStageArgs& args, const HeadBinding& h
 inline void Stage1ReleaseVNewWork(const VecStageArgs& args, const HeadBinding& head)
 {
     const int bank = FixedMemory::LocalBank(head);
-    // v_new GM 是所有分支都存在的最后一条 MTE3；gk-only 还要计入 L1 右操作数 MTE3。
+    // v_new GM 是所有分支都存在的最后一条 MTE3；右操作数 GM ND 的 MTE3
+    // 已在 Stage1ComputeAndWriteVNew 中等待完成，随后由 Stage2 搬入 L1 NZ。
     wait_mte3_vnew_done(args.plan->chunk, head.hv);
     args.memory->ReleaseVNewWorkAfterMte3(head);
     if (args.plan->hasNextChunk || args.plan->hasNextHeadRound) {
@@ -301,7 +313,7 @@ inline VecStageResult RunStage1Arch22(const VecStageArgs& args)
         Stage1WriteH0IfNeeded(args, head);
         Stage1ReleaseVNewWork(args, head);
         ++result.activeTaskCount;
-        result.rightOperandReady = result.rightOperandReady || plan.stage2Required;
+        result.rightGmReady = result.rightGmReady || plan.stage2Required;
         result.alphaReady = result.alphaReady ||
                             (plan.gateMode == GateMode::ScalarG && plan.stage2Required);
     }
@@ -392,14 +404,13 @@ inline void Stage3ComputeRNext(const VecStage3Args& args, const HeadBinding& hea
 
     // 子模块 Stage3WriteStateOutputs：只写有真实消费者的 Hnext 或 final_state。
     if (!plan.chunk.last) {
-        // H_{c+1} 同时写公开 h 和 L1 resident；两路 MTE3 完成前不能发布 HReady。
+        // H_{c+1} 只写公开 GM 的 layout-aware 形式；下一 chunk 的 S0 再用 MTE2 转成 L1 NZ。
         args.memory->ProduceHForS3(head.hSlot);
         Mte3WriteHLayoutAwareAsync(*args.out, *args.tiling, plan, head, hNext);
-        Mte3WriteL1ResidentAsync(L1H(args.memory->l1, head.hSlot), hNext);
         wait_mte3_hnext_done(head.hSlot);
         args.memory->MarkHReady(head.hSlot);
-        args.sync->Set(EventKind::HReady, head.hSlot, /*S3 MTE3*/ 1,
-                       /*下一 chunk S0 MTE1*/ 1);
+        args.sync->Set(EventKind::HGmReady, head.hSlot, /*S3 MTE3*/ 1,
+                       /*下一 chunk S0 MTE2*/ 0);
     }
 
     if (plan.chunk.last && args.tiling->outputFinalState) {

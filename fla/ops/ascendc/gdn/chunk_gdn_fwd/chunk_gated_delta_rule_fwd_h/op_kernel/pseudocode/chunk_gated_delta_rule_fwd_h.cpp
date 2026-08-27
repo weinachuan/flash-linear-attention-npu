@@ -76,18 +76,20 @@ inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan)
     } else if (noInitialFirst) {
         variant = Stage1Variant::NoP;
     }
-    // S1 等待 PReady（如有），一次 VF 生成 V_new/右操作数，并在 MTE3 完成后发布 RightReady。
-    RunStage1ByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &plan,
+    // S1 等待 PReady（如有），一次 VF 生成 V_new/右操作数；右操作数先经 MTE3 写 GM ND，
+    // 由 S2 再搬成 L1 NZ 后才发布 RightL1Ready。
+    RunStage1ByArch({&ctx.inputs, &ctx.outputs, &ctx.workspace, &ctx.tiling, &plan,
                      &ctx.memory, &ctx.sync, variant});
 
     if (!FwdHStagePolicy::NeedStage2(plan)) {
         // final_state 未请求时，最终 chunk 不加载 kg、不执行 S2/S3，也不写无消费者的 L1 右操作数。
         return;
     }
-    // S2 先按 requiredKh[] 搬运 kg，再等待 kg_ready/RightReady，完成每个 head 的 MMAD/D Fixpipe，
+    // S2 先按 requiredKh[] 搬运 kg，再完成每个 head 的 GM ND -> L1 NZ、MMAD/D Fixpipe，
     // 并按最后消费者释放 kg/right。
-    RunStage2ByArch({&ctx.inputs, &ctx.tiling, &plan, &ctx.memory, &ctx.sync});
-    // S3 等待 DReady，更新 rolling state；非末 chunk 发布 HReady，末 chunk 按需写 final_state。
+    RunStage2ByArch({&ctx.inputs, &ctx.tiling, &plan, &ctx.workspace, &ctx.memory, &ctx.sync});
+    // S3 等待 DReady，更新 rolling state；非末 chunk 写 H GM layout-aware 并发布 HGmReady，
+    // 下一 chunk 的 S0 再搬成 L1 NZ；末 chunk 按需写 final_state。
     RunStage3ByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &plan, &ctx.memory, &ctx.sync});
 }
 
@@ -190,6 +192,7 @@ inline PseudocodeTensorTuple chunk_gated_delta_rule_fwd_h(
     }
     ctx.tiling = host.tiling;
     ctx.outputs = host.outputs;
+    ctx.workspace = host.workspace;
     RunFwdH(ctx);
     return MakeOutputs(ctx.outputs);
 }

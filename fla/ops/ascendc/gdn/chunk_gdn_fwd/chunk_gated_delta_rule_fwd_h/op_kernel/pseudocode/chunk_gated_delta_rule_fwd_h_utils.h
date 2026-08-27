@@ -156,6 +156,10 @@ inline HostResult ValidateAndBuildTiling(const ApiInputs& in)
                               in.stateVFirst ? kValueDim : kKeyDim,
                               in.stateVFirst ? kKeyDim : kValueDim};
     result.outputs.v_new.shape = {in.k.shape.d0, hv, in.k.shape.d2, kValueDim, 0};
+    // 这是内部 scratch，不属于公开返回值；按 head_round 的 4 个 slot 复用。
+    result.workspace.rightOperandGm.shape = {kMaxRoundHeads, kBatchTokens, kValueDim, 0, 0};
+    result.workspace.rightOperandGm.dtype = StateType::Bf16;
+    result.workspace.rightOperandGm.present = true;
     if (in.outputFinalState) {
         result.outputs.finalState.shape = {result.tiling.sequenceCount, hv,
                                            in.stateVFirst ? kValueDim : kKeyDim,

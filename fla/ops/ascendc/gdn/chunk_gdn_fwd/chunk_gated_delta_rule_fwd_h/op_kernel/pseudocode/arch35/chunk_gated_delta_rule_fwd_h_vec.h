@@ -12,6 +12,7 @@ namespace fwd_h_pseudocode {
 struct VecStageArgs {
     const ApiInputs* in = nullptr;
     const ApiOutputs* out = nullptr;
+    WorkspaceRefs* workspace = nullptr;
     const TilingPlan* tiling = nullptr;
     const RoundPlan* plan = nullptr;
     FixedMemory* memory = nullptr;
@@ -41,7 +42,7 @@ struct SMinusOneArgs {
 };
 
 struct VecStageResult {
-    bool rightOperandReady = false;
+    bool rightGmReady = false;
     bool alphaReady = false;
     bool nextHReady = false;
     bool finalStateWritten = false;
@@ -352,8 +353,6 @@ inline void A5SMinusOneConvertAndWriteH0(const SMinusOneArgs& args,
     args.sync->Release(EventKind::InitialInputFree, bank, /*S-1 VF*/ 1);
     Mte3WriteH0LayoutAwareAsync(*args.out, *args.tiling, *args.sequence, head.hv,
                                 UbInitialHOutput(*args.memory, head));
-    Mte3WriteL1ResidentAsync(L1H(args.memory->l1, head.hSlot),
-                             UbInitialHOutput(*args.memory, head));
     wait_mte3_h0_done(bank);
     args.memory->MarkHReady(head.hSlot);
     args.memory->MarkInitialHOutputReady(head);
@@ -377,7 +376,7 @@ inline void RunSMinusOneArch35(const SMinusOneArgs& args)
     args.sync->Set(EventKind::InitialPhaseDrain, args.sequence->sequence,
                    /*S-1 MTE3*/ 1, /*调度器*/ -1);
     for (int local = 0; local < args.activeHvCount; ++local) {
-        args.sync->Set(EventKind::HReady, local, /*S-1 phase*/ 1, /*S0 MTE1*/ 1);
+        args.sync->Set(EventKind::HGmReady, local, /*S-1 phase*/ 1, /*S0 MTE2*/ 0);
         HeadBinding head{};
         head.roundHead = local;
         head.hv = args.activeHvBegin + local;
@@ -495,12 +494,18 @@ inline void A5Stage1ComputeAndWrite(const VecStageArgs& args, const HeadBinding&
     write_v_new_from_ub(*args.out, plan.chunk, head.hv,
                         UbVNewBf16(*args.memory, head, args.tiling->stateType));
     if (writeRight) {
-        args.memory->AcquireRightForS1(head.hSlot);
-        Mte3WriteL1RightZnAsync(L1Right(args.memory->l1, head.hSlot),
-                                UbRightBf16(*args.memory, head), plan.chunk.validTokens);
-        wait_mte3_right_done(head.hSlot);
-        args.memory->MarkRightReady(head.hSlot);
-        args.sync->Set(EventKind::RightReady, head.hSlot, /*S1 MTE3*/ 1, /*S2 MTE1*/ 2);
+        // UB right 是 ND；Stage1 只写 roundHead 对应的 GM scratch，禁止直接 UB -> L1。
+        const int rightSlot = head.roundHead;
+        if (args.memory->rightGm[rightSlot].generation > 0 && !plan.roundBoundaryDrained) {
+            args.sync->Wait(EventKind::RightGmFree, rightSlot, /*下一 chunk S1 MTE3*/ 1);
+        }
+        args.memory->AcquireRightGmForS1(rightSlot);
+        Mte3WriteRightOperandGmNdAsync(
+            args.workspace->rightOperandGm, rightSlot, plan.chunk,
+            UbRightBf16(*args.memory, head), plan.chunk.validTokens);
+        wait_mte3_right_gm_done(rightSlot);
+        args.memory->MarkRightGmReady(rightSlot);
+        args.sync->Set(EventKind::RightGmReady, rightSlot, /*S1 MTE3*/ 1, /*S2 MTE2*/ 0);
     }
     if (hasP) {
         args.memory->ReleasePAfterS1(head);
@@ -550,7 +555,7 @@ inline VecStageResult RunStage1Arch35(const VecStageArgs& args)
         A5Stage1ComputeAndWrite(args, head);
         A5Stage1ReleaseWork(args, head);
         ++result.activeTaskCount;
-        result.rightOperandReady = result.rightOperandReady || plan.stage2Required;
+        result.rightGmReady = result.rightGmReady || plan.stage2Required;
         result.alphaReady = result.alphaReady ||
                             (plan.gateMode == GateMode::ScalarG && plan.stage2Required);
     }
@@ -629,12 +634,10 @@ inline void A5Stage3ComputeAndWrite(const VecStage3Args& args,
         args.memory->ProduceHForS3(head.hSlot);
         Mte3WriteHLayoutAwareAsync(*args.out, *args.tiling, plan, head,
                                    UbHWriteTarget(*args.memory, head));
-        Mte3WriteL1ResidentAsync(L1H(args.memory->l1, head.hSlot),
-                                 UbHWriteTarget(*args.memory, head));
         wait_mte3_hnext_done(head.hSlot);
         args.memory->MarkHReady(head.hSlot);
-        args.sync->Set(EventKind::HReady, head.hSlot, /*S3 MTE3*/ 1,
-                       /*下一 chunk S0 MTE1*/ 1);
+        args.sync->Set(EventKind::HGmReady, head.hSlot, /*S3 MTE3*/ 1,
+                       /*下一 chunk S0 MTE2*/ 0);
     } else if (args.tiling->outputFinalState) {
         Mte3WriteFinalStateLayoutAwareAsync(
             *args.out, *args.tiling, plan, head,

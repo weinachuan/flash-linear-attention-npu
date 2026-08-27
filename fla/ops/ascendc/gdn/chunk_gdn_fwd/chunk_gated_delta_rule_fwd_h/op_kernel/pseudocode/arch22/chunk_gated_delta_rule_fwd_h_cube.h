@@ -21,6 +21,7 @@ struct CubeStage2Args {
     const ApiInputs* in = nullptr;
     const TilingPlan* tiling = nullptr;
     const RoundPlan* plan = nullptr;
+    WorkspaceRefs* workspace = nullptr;
     FixedMemory* memory = nullptr;
     SyncLedger* sync = nullptr;
 };
@@ -47,15 +48,22 @@ inline void Stage0LoadH(const CubeStage0Args& args, const HeadBinding& head)
         args.memory->AcquireHForS0(head.hSlot);
         Mte2StateToCanonicalH(*args.in, head.hv, args.tiling->stateLayout,
                               L1H(args.memory->l1, head.hSlot));
+        wait_mte2_h_l1_done(head.hSlot);
         args.memory->MarkHReady(head.hSlot);
         args.sync->Set(EventKind::HReady, head.hSlot, /*S0 MTE2*/ 0,
                        /*S0 MTE1*/ 1);
         return;
     }
 
-    // FP32 initial 来自 S-1；后续 chunk 来自前一个 chunk 的 S3。
-    // 两者都必须由对应 producer 发布 HReady 后，S0 才能消费。
-    args.sync->Wait(EventKind::HReady, head.hSlot, /*S0 MTE1*/ 1);
+    // FP32 initial 来自 S-1；后续 chunk 来自前一个 chunk 的 S3。producer 先把 layout-aware H
+    // 写到 GM，S0 再用 MTE2 搬成 L1 NZ；禁止把 UB 数据直接写入 L1。
+    args.sync->Wait(EventKind::HGmReady, head.hSlot, /*S0 MTE2*/ 0);
+    Mte2CopyHFromGmLayoutAwareToL1NzAsync(
+        *args.out, *args.tiling, *args.plan, head,
+        L1H(args.memory->l1, head.hSlot));
+    wait_mte2_h_l1_done(head.hSlot);
+    args.sync->Set(EventKind::HReady, head.hSlot, /*S0 MTE2*/ 0,
+                   /*S0 MTE1*/ 1);
     args.memory->BeginHReadFromS3(head.hSlot);
 }
 
@@ -171,6 +179,25 @@ inline void Stage2EnsureKgReady(const CubeStage2Args& args, const kg_binding& bi
                    /*S2 MTE1*/ 2);
 }
 
+inline void Stage2LoadRightToL1Nz(const CubeStage2Args& args, const HeadBinding& head)
+{
+    const int rightGmSlot = head.roundHead;
+    // Stage1 已经把 UB ND 写入 GM；先等 GM 写出，再由 Stage2 MTE2 完成 ND -> NZ 的落 L1。
+    args.sync->Wait(EventKind::RightGmReady, rightGmSlot, /*S2 MTE2*/ 0);
+    args.memory->AcquireRightForS2Mte2(head.hSlot);
+    Mte2CopyRightOperandGmNdToL1NzAsync(
+        args.workspace->rightOperandGm, rightGmSlot, args.plan->chunk,
+        L1Right(args.memory->l1, head.hSlot), args.plan->chunk.validTokens);
+    wait_mte2_right_l1_done(head.hSlot);
+    args.memory->MarkRightL1Ready(head.hSlot);
+    // GM scratch 在 MTE2 完成后已经没有消费者，允许下一 chunk/round 的 Stage1 复用。
+    args.memory->ReleaseRightGmAfterS2Mte2(rightGmSlot);
+    args.sync->Set(EventKind::RightGmFree, rightGmSlot, /*S2 MTE2*/ 0,
+                   /*下一 S1 MTE3*/ 1);
+    args.sync->Set(EventKind::RightL1Ready, head.hSlot, /*S2 MTE2*/ 0,
+                   /*S2 MTE1*/ 2);
+}
+
 inline void Stage2ComputeDForHead(const CubeStage2Args& args, const HeadBinding& head)
 {
     const kg_binding& binding = args.plan->kg[head.kgSlot];
@@ -180,9 +207,10 @@ inline void Stage2ComputeDForHead(const CubeStage2Args& args, const HeadBinding&
     if (head.roundHead == binding.firstConsumerRoundHead) {
         args.sync->Wait(EventKind::kg_ready, binding.slot, /*S2 MTE1*/ 2);
     }
-    // 子模块 Stage2WaitRightAndAcquireD：RightReady 同时证明 S1 右操作数 MTE3
-    // 已完成、P owner 已释放，随后才能获取 D UB bank。
-    args.sync->Wait(EventKind::RightReady, head.hSlot, /*S2 MTE1*/ 2);
+    // 子模块 Stage2LoadRightToL1Nz：S1 的 GM ND 已就绪后，再搬为 L1 NZ。
+    Stage2LoadRightToL1Nz(args, head);
+    // L1 NZ 已经由本 head 的 Stage2 MTE2 生成，之后才允许 MTE1 读右操作数。
+    args.sync->Wait(EventKind::RightL1Ready, head.hSlot, /*S2 MTE1*/ 2);
     const auto& localData = args.memory->localData[FixedMemory::LocalBank(head)];
     if (localData.generation > 0 && !args.plan->roundBoundaryDrained) {
         const EventKind freeEvent = localData.previousOwner == LocalDataOwner::P ||

@@ -13,7 +13,8 @@ enum class EventKind {
     InitialInputReady, // S-1 MTE2 -> S-1 VF
     InitialInputFree,  // S-1 VF -> 下一代 S-1 MTE2
     InitialPhaseDrain, // 当前 round 全部 S-1 MTE3 完成
-    HReady,            // S-1/S3 MTE3 或 S0 本地 MTE2 -> 下一 S0 MTE1
+    HGmReady,          // S-1/S3 MTE3(GM layout-aware) -> 下一 S0 MTE2
+    HReady,            // S0 MTE2(GM -> L1 NZ) -> S0 MTE1
     HFree,             // S0 MTE1 -> 下一 H owner
     WReady,            // S0 MTE2 -> S0 MTE1
     WFree,             // S0 MTE1 -> 下一 W owner
@@ -22,7 +23,9 @@ enum class EventKind {
     PReady,            // S0 Fixpipe -> S1 VF
     PFree,             // S1 VF 最后一次读取 P -> 下一 local data owner
     LocalDataFree,     // 首块 H0 MTE3 -> 同一 local data bank 的下一真实 producer
-    RightReady,        // S1 MTE3 -> S2 MTE1
+    RightGmReady,      // S1 MTE3(UB ND -> GM ND) -> S2 MTE2
+    RightGmFree,       // S2 MTE2(GM ND -> L1 NZ) -> 下一 S1 GM producer
+    RightL1Ready,      // S2 MTE2(GM ND -> L1 NZ) -> S2 MTE1
     RightFree,         // S2 MTE1 -> 下一 L1 right/H owner
     DReady,            // S2 Fixpipe -> S3 VF
     DFree,             // S3 VF 最后一次读取 D -> 下一 local data owner
@@ -95,9 +98,15 @@ public:
             for (int i = 0; i < previousRound.activeHvCount; ++i) {
                 Wait(EventKind::DFree, previousRound.heads[i].roundHead, /*下一 round local data producer*/ -1);
             }
+            // 右操作数的 GM scratch 也按 head_round slot 复用；Stage2 MTE2 完成前
+            // 下一 round 不得重新写同一 ND scratch。
+            for (int i = 0; i < previousRound.activeHvCount; ++i) {
+                Wait(EventKind::RightGmFree, previousRound.heads[i].roundHead,
+                     /*下一 round S1 GM producer*/ -1);
+            }
         }
         if (previousRound.hasNextHeadRound) {
-            // S1 的 V_new GM/L1 MTE3 可能仍读取 UB work bank；下一 round 的 S-1 或 S1
+            // S1 的 V_new/right GM MTE3 可能仍读取 UB work bank；下一 round 的 S-1 或 S1
             // 不能靠 head loop 的自然顺序覆写它。
             for (int i = 0; i < previousRound.activeHvCount; ++i) {
                 const int bank = (i % kAivCount) * kLocalSlotsPerAiv + (i / kAivCount);
@@ -146,7 +155,7 @@ struct L1SlotTable {
     int wBaseKiB = 0;       // [0, 64)：4 个 16 KiB W slot
     int hBaseKiB = 128;     // [128, 256)：4 个 32 KiB H slot
     int kgBaseKiB = 256;    // [256, 320)：4 个 16 KiB kg slot
-    int rightBaseKiB = 128; // S0 读取释放后，S1 才能复用 H slot
+    int rightBaseKiB = 128; // S2 GM->L1 NZ 后占用；与 H slot 物理重叠但生命周期不重叠
 };
 
 struct UbSlotTable {
@@ -165,6 +174,7 @@ public:
     UbSlotTable ub{};
     std::array<MemoryTicket, kMaxRoundHeads> h{};
     std::array<MemoryTicket, kMaxRoundHeads> w{};
+    std::array<MemoryTicket, kMaxRoundHeads> rightGm{};
     std::array<MemoryTicket, kMaxRoundHeads> right{};
     std::array<MemoryTicket, kMaxKeySlots> kg{};
     std::array<LocalDataTicket, kAivCount * kLocalSlotsPerAiv> localData{};
@@ -391,7 +401,7 @@ public:
 
     void BeginHReadFromS3(int hSlot)
     {
-        // S3 已生成该 resident，并发布 HReady。
+        // Stage0 已把 S3 的 GM ND 转成 L1 NZ，并发布 HReady。
         Require(h[hSlot].state == SlotState::Ready);
     }
 
@@ -422,14 +432,32 @@ public:
     void MarkWReady(int wSlot) { Require(w[wSlot].state == SlotState::Loading); w[wSlot].state = SlotState::Ready; }
     void ReleaseWAfterS0Mte1(int wSlot) { Require(w[wSlot].state == SlotState::Ready); w[wSlot].state = SlotState::Free; }
 
-    void AcquireRightForS1(int hSlot)
+    void AcquireRightGmForS1(int roundHead)
     {
-        // 只有 S0 的 MTE1 释放物理 H slot 后，S1 才能复用该 slot。
+        // S1 只拥有 GM ND scratch，不拥有与 H 重叠的 L1 right slot。
+        RequireFree(rightGm[roundHead]);
+        rightGm[roundHead].state = SlotState::Loading;
+        ++rightGm[roundHead].generation;
+    }
+    void MarkRightGmReady(int roundHead)
+    {
+        Require(rightGm[roundHead].state == SlotState::Loading);
+        rightGm[roundHead].state = SlotState::Ready;
+    }
+    void ReleaseRightGmAfterS2Mte2(int roundHead)
+    {
+        Require(rightGm[roundHead].state == SlotState::Ready);
+        rightGm[roundHead].state = SlotState::Free;
+    }
+
+    void AcquireRightForS2Mte2(int hSlot)
+    {
+        // L1 right 只有在 Stage2 的 GM->L1 NZ 开始时才 acquire；S1 不直接写 L1。
         RequireFree(right[hSlot]);
         right[hSlot].state = SlotState::Loading;
         ++right[hSlot].generation;
     }
-    void MarkRightReady(int hSlot) { Require(right[hSlot].state == SlotState::Loading); right[hSlot].state = SlotState::Ready; }
+    void MarkRightL1Ready(int hSlot) { Require(right[hSlot].state == SlotState::Loading); right[hSlot].state = SlotState::Ready; }
     void ReleaseRightAfterS2Mte1(int hSlot) { Require(right[hSlot].state == SlotState::Ready); right[hSlot].state = SlotState::Free; }
 
     void acquire_kg(int kgSlot)
@@ -470,6 +498,7 @@ struct FwdHStagePolicy {
 struct SchedulerContext {
     ApiInputs inputs{};
     ApiOutputs outputs{};
+    WorkspaceRefs workspace{};
     TilingPlan tiling{};
     FixedMemory memory{};
     SyncLedger sync{};
