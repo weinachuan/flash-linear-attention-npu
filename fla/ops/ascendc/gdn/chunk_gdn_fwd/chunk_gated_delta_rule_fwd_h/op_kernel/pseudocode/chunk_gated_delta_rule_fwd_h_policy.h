@@ -10,19 +10,29 @@ namespace fwd_h_pseudocode {
 enum class Stage1Variant { WithP, NoP, v_new_only };
 
 enum class EventKind {
-    HReady,
-    HFree,
-    WReady,
-    WFree,
-    kg_ready,
-    kg_overwrite_safe,
-    PReady,
-    RightReady,
-    RightFree,
-    DReady,
-    StateReady,
-    StateFree,
-    TerminalDrain,
+    InitialInputReady, // S-1 MTE2 -> S-1 VF
+    InitialInputFree,  // S-1 VF -> 下一代 S-1 MTE2
+    InitialPhaseDrain, // 当前 round 全部 S-1 MTE3 完成
+    HReady,            // S-1/S3 MTE3 或 S0 本地 MTE2 -> 下一 S0 MTE1
+    HFree,             // S0 MTE1 -> 下一 H owner
+    WReady,            // S0 MTE2 -> S0 MTE1
+    WFree,             // S0 MTE1 -> 下一 W owner
+    kg_ready,          // kg MTE2 -> S2 首个 MTE1
+    kg_overwrite_safe, // 当前 round 最后一个 S2 MTE1 -> 下一 kg MTE2
+    PReady,            // S0 Fixpipe -> S1 VF
+    PFree,             // S1 VF 最后一次读取 P -> 下一 local data owner
+    LocalDataFree,     // 首块 H0 MTE3 -> 同一 local data bank 的下一真实 producer
+    RightReady,        // S1 MTE3 -> S2 MTE1
+    RightFree,         // S2 MTE1 -> 下一 L1 right/H owner
+    DReady,            // S2 Fixpipe -> S3 VF
+    DFree,             // S3 VF 最后一次读取 D -> 下一 local data owner
+    VNewWorkFree,      // S1 V_new 相关 MTE3 -> 下一 S1 MTE2
+    StateToVFree,      // state MTE3 -> 下一 Vector consumer
+    StateToMte2Free,   // state MTE3 -> 下一 state MTE2 producer
+    UnionFree,         // 特定 v_new-only union -> 下一真实 AIC S0
+    StateReady,        // S1/状态 MTE2 -> S3 VF
+    StateFree,         // 状态最后消费者 -> 下一状态 owner
+    TerminalDrain,     // round/sequence 末尾所有异步搬运
 };
 
 struct EventToken {
@@ -59,10 +69,9 @@ public:
 
     void Release(EventKind kind, int slot, int consumer)
     {
-        // 只有当前消费者完成最后一次读取后，才能发出 free/overwrite-safe 事件。
-        (void)kind;
-        (void)slot;
-        (void)consumer;
+        // 只有当前消费者完成最后一次读取后，才能发出 free/overwrite-safe 事件；
+        // 这里复用 Set 记录一个可被下一 owner Wait 的反向 token。
+        Set(kind, slot, consumer, /*下一 owner*/ -1);
     }
 
     void WaitBeforeNextRound(const RoundPlan& previousRound)
@@ -78,6 +87,37 @@ public:
             for (int i = 0; i < previousRound.activeHvCount; ++i) {
                 Wait(EventKind::WFree, previousRound.heads[i].wSlot, /*下一 round 生产者*/ -1);
                 Wait(EventKind::HFree, previousRound.heads[i].hSlot, /*下一 round 生产者*/ -1);
+                Wait(EventKind::PFree, previousRound.heads[i].roundHead, /*下一 round S0 Fixpipe*/ 0);
+            }
+        }
+        if (previousRound.stage2Required) {
+            // D 是上一轮 S2 的输出；即使本轮没有 S0，也要等 S3 读完 D 后才能复用 local data。
+            for (int i = 0; i < previousRound.activeHvCount; ++i) {
+                Wait(EventKind::DFree, previousRound.heads[i].roundHead, /*下一 round local data producer*/ -1);
+            }
+        }
+        if (previousRound.hasNextHeadRound) {
+            // S1 的 V_new GM/L1 MTE3 可能仍读取 UB work bank；下一 round 的 S-1 或 S1
+            // 不能靠 head loop 的自然顺序覆写它。
+            for (int i = 0; i < previousRound.activeHvCount; ++i) {
+                const int bank = (i % kAivCount) * kLocalSlotsPerAiv + (i / kAivCount);
+                Wait(EventKind::VNewWorkFree, bank,
+                     /*下一 round producer*/ -1);
+            }
+            if (previousRound.stage3Required) {
+                for (int i = 0; i < previousRound.activeHvCount; ++i) {
+                    if (previousRound.stateType == StateType::Bf16) {
+                        const int bank = (i % kAivCount) * kLocalSlotsPerAiv + (i / kAivCount);
+                        if (previousRound.nextRoundStartsWithS0) {
+                            Wait(EventKind::StateToMte2Free, bank, /*下一 round S1 MTE2*/ 0);
+                        } else if (previousRound.nextRoundStartsWithS1NoP) {
+                            Wait(EventKind::StateToVFree, bank, /*下一 round S1 VF*/ 1);
+                        }
+                    } else if (i == 0) {
+                        // FP32 state 使用单个 shared scratch，下一 round 的第一个 S3 负责重新 MTE2。
+                        Wait(EventKind::StateToMte2Free, 0, /*下一 round state MTE2*/ 0);
+                    }
+                }
             }
         }
         Wait(EventKind::TerminalDrain, previousRound.round, /*调度器*/ -1);
@@ -113,7 +153,8 @@ struct UbSlotTable {
     int localDataBaseKiB[kLocalSlotsPerAiv] = {0, 64};
     int pBaseKiB[kLocalSlotsPerAiv] = {0, 64};
     int dBaseKiB[kLocalSlotsPerAiv] = {0, 64};
-    int v_new_work_base_kib[kLocalSlotsPerAiv] = {128, 160};
+    int vNewWorkBaseBf16KiB[kLocalSlotsPerAiv] = {192, 208};
+    int vNewWorkBaseFp32KiB[kLocalSlotsPerAiv] = {128, 144};
     int stateScratchBaseKiB = 160;
     int gateBaseKiB = 224;
 };
@@ -126,6 +167,218 @@ public:
     std::array<MemoryTicket, kMaxRoundHeads> w{};
     std::array<MemoryTicket, kMaxRoundHeads> right{};
     std::array<MemoryTicket, kMaxKeySlots> kg{};
+    std::array<LocalDataTicket, kAivCount * kLocalSlotsPerAiv> localData{};
+    std::array<MemoryTicket, kAivCount * kLocalSlotsPerAiv> vNewWork{};
+    std::array<StateTicket, kAivCount * kLocalSlotsPerAiv> bf16State{};
+    StateTicket fp32StateScratch{0, StateOwner::Free, 0};
+    std::array<MemoryTicket, kAivCount * kLocalSlotsPerAiv> initialInput{};
+    std::array<MemoryTicket, kAivCount * kLocalSlotsPerAiv> initialHOutput{};
+
+    static int LocalBank(const HeadBinding& head)
+    {
+        return head.aiv * kLocalSlotsPerAiv + head.localSlot;
+    }
+
+    void AcquireLocalDataForP(const HeadBinding& head)
+    {
+        auto& ticket = localData[LocalBank(head)];
+        Require(ticket.owner == LocalDataOwner::Free);
+        ticket.owner = LocalDataOwner::P;
+        ++ticket.generation;
+    }
+
+    void MarkPReady(const HeadBinding& head)
+    {
+        Require(localData[LocalBank(head)].owner == LocalDataOwner::P);
+    }
+
+    void ReleasePAfterS1(const HeadBinding& head)
+    {
+        auto& ticket = localData[LocalBank(head)];
+        Require(ticket.owner == LocalDataOwner::P);
+        ticket.previousOwner = ticket.owner;
+        ticket.owner = LocalDataOwner::Free;
+    }
+
+    void BeginHWriteAfterDRow(const HeadBinding& head)
+    {
+        auto& ticket = localData[LocalBank(head)];
+        Require(ticket.owner == LocalDataOwner::D);
+        ticket.owner = LocalDataOwner::HWrite;
+    }
+
+    void AcquireLocalDataForH0(const HeadBinding& head)
+    {
+        auto& ticket = localData[LocalBank(head)];
+        Require(ticket.owner == LocalDataOwner::Free);
+        ticket.owner = LocalDataOwner::H0;
+        ++ticket.generation;
+    }
+
+    void ReleaseH0AfterMte3(const HeadBinding& head)
+    {
+        auto& ticket = localData[LocalBank(head)];
+        Require(ticket.owner == LocalDataOwner::H0);
+        ticket.previousOwner = ticket.owner;
+        ticket.owner = LocalDataOwner::Free;
+    }
+
+    void AcquireLocalDataForD(const HeadBinding& head)
+    {
+        auto& ticket = localData[LocalBank(head)];
+        Require(ticket.owner == LocalDataOwner::Free);
+        ticket.owner = LocalDataOwner::D;
+        ++ticket.generation;
+    }
+
+    void MarkDReady(const HeadBinding& head)
+    {
+        Require(localData[LocalBank(head)].owner == LocalDataOwner::D);
+    }
+
+    void ReleaseDAfterS3(const HeadBinding& head)
+    {
+        auto& ticket = localData[LocalBank(head)];
+        Require(ticket.owner == LocalDataOwner::D || ticket.owner == LocalDataOwner::HWrite);
+        ticket.previousOwner = ticket.owner;
+        ticket.owner = LocalDataOwner::Free;
+    }
+
+    void AcquireVNewWorkForS1(const HeadBinding& head)
+    {
+        auto& ticket = vNewWork[LocalBank(head)];
+        RequireFree(ticket);
+        ticket.state = SlotState::Loading;
+        ++ticket.generation;
+    }
+
+    void MarkVNewWorkReady(const HeadBinding& head)
+    {
+        Require(vNewWork[LocalBank(head)].state == SlotState::Loading);
+        vNewWork[LocalBank(head)].state = SlotState::Ready;
+    }
+
+    void ReleaseVNewWorkAfterMte3(const HeadBinding& head)
+    {
+        Require(vNewWork[LocalBank(head)].state == SlotState::Ready);
+        vNewWork[LocalBank(head)].state = SlotState::Free;
+    }
+
+    void InitializeBf16StateInS1(const HeadBinding& head)
+    {
+        auto& ticket = bf16State[LocalBank(head)];
+        Require(ticket.owner == StateOwner::Free);
+        ticket.owner = StateOwner::RResident;
+        ++ticket.generation;
+    }
+
+    void AcquireInitialInput(const HeadBinding& head)
+    {
+        auto& ticket = initialInput[LocalBank(head)];
+        RequireFree(ticket);
+        ticket.state = SlotState::Loading;
+        ++ticket.generation;
+    }
+
+    void MarkInitialInputReady(const HeadBinding& head)
+    {
+        Require(initialInput[LocalBank(head)].state == SlotState::Loading);
+        initialInput[LocalBank(head)].state = SlotState::Ready;
+    }
+
+    void ReleaseInitialInput(const HeadBinding& head)
+    {
+        Require(initialInput[LocalBank(head)].state == SlotState::Ready);
+        initialInput[LocalBank(head)].state = SlotState::Free;
+    }
+
+    void AcquireInitialHOutput(const HeadBinding& head)
+    {
+        auto& ticket = initialHOutput[LocalBank(head)];
+        RequireFree(ticket);
+        ticket.state = SlotState::Loading;
+        ++ticket.generation;
+    }
+
+    void MarkInitialHOutputReady(const HeadBinding& head)
+    {
+        Require(initialHOutput[LocalBank(head)].state == SlotState::Loading);
+        initialHOutput[LocalBank(head)].state = SlotState::Ready;
+    }
+
+    void ReleaseInitialHOutput(const HeadBinding& head)
+    {
+        Require(initialHOutput[LocalBank(head)].state == SlotState::Ready);
+        initialHOutput[LocalBank(head)].state = SlotState::Free;
+    }
+
+    void AcquireBf16StateForS3(const HeadBinding& head)
+    {
+        auto& ticket = bf16State[LocalBank(head)];
+        Require(ticket.owner == StateOwner::Free || ticket.owner == StateOwner::RResident);
+        ticket.owner = StateOwner::RResident;
+        ++ticket.generation;
+    }
+
+    void MarkBf16StateMte3InFlight(const HeadBinding& head)
+    {
+        auto& ticket = bf16State[LocalBank(head)];
+        Require(ticket.owner == StateOwner::RResident);
+        ticket.owner = StateOwner::RNextMte3;
+    }
+
+    void MarkBf16StateConsumedByNextVf(const HeadBinding& head)
+    {
+        auto& ticket = bf16State[LocalBank(head)];
+        Require(ticket.owner == StateOwner::RNextMte3 || ticket.owner == StateOwner::RResident);
+        ticket.owner = StateOwner::RResident;
+    }
+
+    void ReleaseBf16StateAtTerminal(const HeadBinding& head)
+    {
+        auto& ticket = bf16State[LocalBank(head)];
+        Require(ticket.owner == StateOwner::RResident || ticket.owner == StateOwner::RNextMte3);
+        ticket.owner = StateOwner::Free;
+    }
+
+    void AcquireFp32StateScratchForS3()
+    {
+        Require(fp32StateScratch.owner == StateOwner::Free);
+        fp32StateScratch.owner = StateOwner::RollingMte2;
+        ++fp32StateScratch.generation;
+    }
+
+    void MarkFp32StateReady()
+    {
+        Require(fp32StateScratch.owner == StateOwner::RollingMte2);
+        fp32StateScratch.owner = StateOwner::RResident;
+    }
+
+    void ReleaseFp32StateScratch()
+    {
+        Require(fp32StateScratch.owner == StateOwner::RResident ||
+                fp32StateScratch.owner == StateOwner::RNextMte3);
+        fp32StateScratch.owner = StateOwner::Free;
+    }
+
+    void ReleaseStateAfterRoundBarrier(const RoundPlan& previousRound)
+    {
+        // WaitBeforeNextRound 已经排空异步 state MTE3；把 owner 显式归还，
+        // 使下一 round 的首块 S1 初始化或 S3 MTE2 不再依赖旧 round 的 owner。
+        if (previousRound.stateType == StateType::Bf16) {
+            for (int i = 0; i < previousRound.activeHvCount; ++i) {
+                bf16State[LocalBank(previousRound.heads[i])].owner = StateOwner::Free;
+            }
+        } else {
+            fp32StateScratch.owner = StateOwner::Free;
+        }
+    }
+
+    void MarkFp32StateMte3InFlight()
+    {
+        Require(fp32StateScratch.owner == StateOwner::RResident);
+        fp32StateScratch.owner = StateOwner::RNextMte3;
+    }
 
     void AcquireHForS0(int hSlot)
     {
@@ -133,6 +386,7 @@ public:
         // 来源只能是 initial GM、S-1 输出或前一个 S3 输出，禁止混合所有者。
         RequireFree(h[hSlot]);
         h[hSlot].state = SlotState::Loading;
+        ++h[hSlot].generation;
     }
 
     void BeginHReadFromS3(int hSlot)
@@ -147,6 +401,7 @@ public:
         RequireFree(h[hSlot]);
         RequireFree(right[hSlot]);
         h[hSlot].state = SlotState::Loading;
+        ++h[hSlot].generation;
     }
 
     void ProduceInitialH(int hSlot)
@@ -158,7 +413,12 @@ public:
     void MarkHReady(int hSlot) { Require(h[hSlot].state == SlotState::Loading); h[hSlot].state = SlotState::Ready; }
     void ReleaseHAfterS0Mte1(int hSlot) { Require(h[hSlot].state == SlotState::Ready); h[hSlot].state = SlotState::Free; }
 
-    void AcquireWForS0(int wSlot) { RequireFree(w[wSlot]); w[wSlot].state = SlotState::Loading; }
+    void AcquireWForS0(int wSlot)
+    {
+        RequireFree(w[wSlot]);
+        w[wSlot].state = SlotState::Loading;
+        ++w[wSlot].generation;
+    }
     void MarkWReady(int wSlot) { Require(w[wSlot].state == SlotState::Loading); w[wSlot].state = SlotState::Ready; }
     void ReleaseWAfterS0Mte1(int wSlot) { Require(w[wSlot].state == SlotState::Ready); w[wSlot].state = SlotState::Free; }
 
@@ -167,6 +427,7 @@ public:
         // 只有 S0 的 MTE1 释放物理 H slot 后，S1 才能复用该 slot。
         RequireFree(right[hSlot]);
         right[hSlot].state = SlotState::Loading;
+        ++right[hSlot].generation;
     }
     void MarkRightReady(int hSlot) { Require(right[hSlot].state == SlotState::Loading); right[hSlot].state = SlotState::Ready; }
     void ReleaseRightAfterS2Mte1(int hSlot) { Require(right[hSlot].state == SlotState::Ready); right[hSlot].state = SlotState::Free; }
@@ -192,7 +453,7 @@ private:
 struct FwdHStagePolicy {
     static bool IsFinalVNewOnly(const RoundPlan& plan, bool outputFinalState)
     {
-        return plan.chunk.last && !outputFinalState;
+        return plan.finalVNewOnly || (plan.chunk.last && !outputFinalState);
     }
 
     static bool NeedStage0(const RoundPlan& plan)

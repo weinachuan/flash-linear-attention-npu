@@ -15,39 +15,39 @@
 
 namespace fwd_h_pseudocode {
 
-inline void RunStage0ByArch(const CubeStage0Args& args)
+inline CubeStageResult RunStage0ByArch(const CubeStage0Args& args)
 {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-    RunStage0Arch35(args);
+    return RunStage0Arch35(args);
 #else
-    RunStage0Arch22(args);
+    return RunStage0Arch22(args);
 #endif
 }
 
-inline void RunStage1ByArch(const VecStageArgs& args)
+inline VecStageResult RunStage1ByArch(const VecStageArgs& args)
 {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-    RunStage1Arch35(args);
+    return RunStage1Arch35(args);
 #else
-    RunStage1Arch22(args);
+    return RunStage1Arch22(args);
 #endif
 }
 
-inline void RunStage2ByArch(const CubeStage2Args& args)
+inline CubeStageResult RunStage2ByArch(const CubeStage2Args& args)
 {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-    RunStage2Arch35(args);
+    return RunStage2Arch35(args);
 #else
-    RunStage2Arch22(args);
+    return RunStage2Arch22(args);
 #endif
 }
 
-inline void RunStage3ByArch(const VecStage3Args& args)
+inline VecStageResult RunStage3ByArch(const VecStage3Args& args)
 {
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-    RunStage3Arch35(args);
+    return RunStage3Arch35(args);
 #else
-    RunStage3Arch22(args);
+    return RunStage3Arch22(args);
 #endif
 }
 
@@ -62,10 +62,11 @@ inline void RunSMinusOneByArch(const SMinusOneArgs& args)
 
 inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan)
 {
-    const bool finalVNewOnly = FwdHStagePolicy::IsFinalVNewOnly(plan, ctx.tiling.outputFinalState);
+    const bool finalVNewOnly = plan.finalVNewOnly;
     const bool noInitialFirst = plan.chunk.first && !ctx.tiling.useInitialState;
 
     if (FwdHStagePolicy::NeedStage0(plan)) {
+        // S0 内部已完成 kg 异步预取、H/W MTE2、MTE1、MMAD、P Fixpipe，并发布 PReady。
         RunStage0ByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &plan, &ctx.memory, &ctx.sync});
     }
 
@@ -75,6 +76,7 @@ inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan)
     } else if (noInitialFirst) {
         variant = Stage1Variant::NoP;
     }
+    // S1 等待 PReady（如有），一次 VF 生成 V_new/右操作数，并在 MTE3 完成后发布 RightReady。
     RunStage1ByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &plan,
                      &ctx.memory, &ctx.sync, variant});
 
@@ -82,7 +84,9 @@ inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan)
         // final_state 未请求时，最终 chunk 不加载 kg、不执行 S2/S3，也不写无消费者的 L1 右操作数。
         return;
     }
+    // S2 等待 kg_ready/RightReady，完成每个 head 的 MMAD/D Fixpipe，并按最后消费者释放 kg/right。
     RunStage2ByArch({&ctx.inputs, &ctx.tiling, &plan, &ctx.memory, &ctx.sync});
+    // S3 等待 DReady，更新 rolling state；非末 chunk 发布 HReady，末 chunk 按需写 final_state。
     RunStage3ByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &plan, &ctx.memory, &ctx.sync});
 }
 
@@ -102,12 +106,13 @@ inline void RunFwdH(SchedulerContext& ctx)
                 const RoundPlan previousRound =
                     BuildChunkPlan(previousHeadRound, ctx.tiling, seq, seq.chunkCount - 1);
                 ctx.sync.WaitBeforeNextRound(previousRound);
+                ctx.memory.ReleaseStateAfterRoundBarrier(previousRound);
             }
 
             // S-1 是当前 round 的生产者，必须在屏障后执行，并在首个 S0 前排空。
             RunSMinusOneByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &seq,
                                 &ctx.memory, &ctx.sync, headRoundPlan.activeHvBegin,
-                                headRoundPlan.activeHvCount});
+                                headRoundPlan.activeHvCount, round > 0});
 
             for (int c = 0; c < seq.chunkCount; ++c) {
                 // chunk 只绑定 token 范围和最终 chunk 分支，不重新计算 required_hk_round。

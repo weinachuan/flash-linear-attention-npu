@@ -21,6 +21,8 @@ enum class StateType { Bf16, Fp32 };
 enum class StateLayout { KV, VK };
 enum class SlotState { Free, Loading, Ready, Reading };
 enum class kg_payload { raw_k, prepared_kg };
+enum class LocalDataOwner { Free, P, VNewWork, D, H0, HWrite };
+enum class StateOwner { Free, InitialMte2, RollingMte2, RResident, RNextMte3 };
 
 struct Shape {
     int64_t d0 = 0;
@@ -117,11 +119,25 @@ struct kg_binding {
     uint64_t generation = 0;
 };
 
+struct LocalDataTicket {
+    int bank = -1;
+    LocalDataOwner owner = LocalDataOwner::Free;
+    LocalDataOwner previousOwner = LocalDataOwner::Free;
+    uint64_t generation = 0;
+};
+
+struct StateTicket {
+    int bank = -1;
+    StateOwner owner = StateOwner::Free;
+    uint64_t generation = 0;
+};
+
 struct RoundPlan {
     int sequence = -1;
     int round = -1;
     ChunkSpan chunk{};
     GateMode gateMode = GateMode::ScalarG;
+    StateType stateType = StateType::Fp32;
     kg_payload kg_payload_kind = kg_payload::raw_k;
     int activeHvBegin = 0;
     int activeHvCount = 0;
@@ -133,6 +149,12 @@ struct RoundPlan {
     bool stage0Required = false;
     bool stage2Required = false;
     bool stage3Required = false;
+    bool finalVNewOnly = false;
+    bool hasNextChunk = false;
+    bool hasNextHeadRound = false;
+    bool nextRoundStartsWithS0 = false;
+    bool nextRoundStartsWithS1NoP = false;
+    bool roundBoundaryDrained = false;
 };
 
 struct TilingPlan {

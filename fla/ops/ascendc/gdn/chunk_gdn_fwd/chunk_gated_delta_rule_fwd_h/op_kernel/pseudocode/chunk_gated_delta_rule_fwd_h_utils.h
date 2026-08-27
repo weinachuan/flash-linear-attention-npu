@@ -197,6 +197,7 @@ inline RoundPlan BuildHeadRoundPlan(const TilingPlan& tiling, int round)
     RoundPlan plan{};
     plan.round = round;
     plan.gateMode = tiling.gateMode;
+    plan.stateType = tiling.stateType;
     plan.kg_payload_kind = tiling.gateMode == GateMode::ScalarG ? kg_payload::raw_k : kg_payload::prepared_kg;
     plan.activeHvBegin = round * kMaxRoundHeads;
     plan.activeHvCount = static_cast<int>(tiling.hv) - plan.activeHvBegin;
@@ -256,6 +257,12 @@ inline RoundPlan BuildChunkPlan(const RoundPlan& headRound, const TilingPlan& ti
     plan.stage2Required = tiling.outputFinalState || !plan.chunk.last;
     plan.stage3Required = plan.stage2Required;
     plan.stage0Required = !(plan.chunk.first && !tiling.useInitialState);
+    plan.finalVNewOnly = plan.chunk.last && !tiling.outputFinalState;
+    plan.hasNextChunk = !plan.chunk.last;
+    plan.hasNextHeadRound = (plan.round + 1) * kMaxRoundHeads < tiling.hv;
+    plan.nextRoundStartsWithS0 = plan.hasNextHeadRound && tiling.useInitialState;
+    plan.nextRoundStartsWithS1NoP = plan.hasNextHeadRound && !tiling.useInitialState;
+    plan.roundBoundaryDrained = plan.round > 0 && plan.chunk.first;
     return plan;
 }
 
