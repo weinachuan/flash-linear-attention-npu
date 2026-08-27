@@ -1,27 +1,37 @@
 # FwdH 伪代码蓝图
 
-本目录是 A5 FwdH 重构的实现蓝图。目录形状参考已有的 `op_host`、`op_kernel/gemm`、
-`op_kernel/epilogue` 和 fast-launch 入口，但代码被隔离在 `op_kernel/pseudocode/` 下，
-明确不加入任何构建目标，也不复制 PR370 的调度或内存行为。
+本目录是 A5 FwdH 重构的实现蓝图。其内部 `op_kernel` 结构与实际工程保持一致，
+但整个目录不加入任何 CMake 构建目标，也不修改现有 kernel。
+
+```text
+op_kernel/
+├── arch22/
+│   ├── chunk_gated_delta_rule_fwd_h_cube.h   # Stage0、Stage2
+│   └── chunk_gated_delta_rule_fwd_h_vec.h    # S-1、Stage1、Stage3
+├── arch35/
+│   ├── chunk_gated_delta_rule_fwd_h_cube.h   # A5 的 Cube 入口
+│   └── chunk_gated_delta_rule_fwd_h_vec.h    # A5 的 Vec 入口
+├── chunk_gated_delta_rule_fwd_h_tiling_key.h # 常量、属性和计划数据结构
+├── chunk_gated_delta_rule_fwd_h_policy.h    # 槽位、所有权和事件策略
+├── chunk_gated_delta_rule_fwd_h_utils.h     # 校验、寻址、GVA 映射和 round 计划
+└── chunk_gated_delta_rule_fwd_h.cpp         # fast-launch 形状入口和总调度
+```
 
 设计文档 `gdn-fwd-h-ascendc-design.md` 是唯一依据。伪代码严格使用设计中的术语：`kg`
 保持小写，公开输出继续使用 `V_new`，`state_v_first` 是 kernel 原生属性，不依赖外部转置。
 
-## 模块契约
+## 文件职责
 
-| 模块 | 职责 | 输入 | 输出 | 生命周期 / 控制 |
+| 文件 | 职责 | 输入 | 输出 | 生命周期 / 控制 |
 | --- | --- | --- | --- | --- |
-| `fwd_h_pseudocode_host.h` | 校验 API，推导 `StateT`、门控模式、varlen span 和输出形状 | API tensor、属性、可选数组 | `TilingPlan`、输出描述符、错误 | kernel launch 前执行；拒绝存在性/形状/dtype 不匹配 |
-| `fwd_h_pseudocode_round_planner.h` | 构造一个 `(sequence, round, chunk)` 计划和当前 round 的精确 key 集合 | `TilingPlan`、sequence/chunk id | `HeadBinding[<=4]`、`requiredKh[]`、`kg_binding[]` | 每个 chunk 重新构造；不预留整段 sequence 的 `kg` |
-| `fwd_h_pseudocode_memory.h` | 跟踪固定 L1/UB 地址和单一所有者状态转换 | slot id、Stage 所有者 | H/W/right/kg 的 ready/free 状态 | H/W/right 在最后一个消费者后释放；`kg` 在最后一次 S2 MTE1 后释放 |
-| `fwd_h_pseudocode_sync.h` | 描述 ready/free/terminal 事件和跨 round 屏障 | 生产者、消费者、slot、generation | 匹配的 `Wait`/`Set`/`Release` 操作 | 不留下未消费 token；屏障返回前下一 round 不能预取 |
-| `fwd_h_pseudocode_s_minus_one.h` | 每个当前 head round 只转换一次 FP32 初态 | FP32 `initial_state`、布局属性、active head 范围 | L1 中规范 BF16 H0 和 GM h0 | 上一 round 屏障后执行，S0 消费 H 前排空；BF16 或无初态时省略 |
-| `fwd_h_pseudocode_stage0.h` | 可选 S0：加载 H/W，异步预取当前 `kg`，计算 `P = W @ H` | 当前 round 计划、GM k/w/state | L1 kg/H/W、UB `P` | `kg` 预取可与 S0 重叠，但直到 S2 才消费；第一个无初态 chunk 不执行 S0 |
-| `fwd_h_pseudocode_stage1.h` | S1 全 head VF：计算 `V_new_fp32`、BF16 `V_new`，以及可选的 `V_new_g`、`alpha` | `u`、可选 `P`、g/gk 模式 | 公共 `v_new`、L1 右操作数、alpha、h0 | `V_new`/`V_new_g` 保留到 S2 MTE1；最终且不输出 final state 时走 `v_new-only` |
-| `fwd_h_pseudocode_stage2.h` | 将每个 `H_v` 与映射的 `kg` 配对并计算 `D` | 当前 round 的 kg slot、S1 右操作数 | UB FP32 `D` | 只有本 round 内 `kh` 相同的 head 才共享 kg slot；round 结束前失效 |
-| `fwd_h_pseudocode_stage3.h` | 更新 rolling state，并按布局写 h/final state | `D`、当前 rolling state、alpha 或 `gk_last` | 下一个 H resident、GM h、GM final_state | 内部 state 始终为 `[K,V]`；GM offset 使用 `state_v_first` |
-| `fwd_h_pseudocode_scheduler.h` | 强制 `sequence -> head_round -> chunk`、S-1、屏障和最终分支 | context 和计划 | 完整输出 tensor | 每个后续 head round 前等待 kg 覆盖安全、W/H free 和 terminal drain |
-| `chunk_gated_delta_rule_fwd_h_pseudocode.cpp` | fast-launch 形状适配器和 kernel 入口 | 框架 tensor/属性 | tuple `(h, v_new, final_state)` | 只负责入口结构；不做外部 L2 转置 |
+| `chunk_gated_delta_rule_fwd_h_tiling_key.h` | 定义固定维度、属性、输入输出、`HeadBinding`、`RoundPlan` | API tensor 和属性 | tiling/round 数据结构 | dispatch 前确定；每个 chunk 使用新的 `RoundPlan` |
+| `chunk_gated_delta_rule_fwd_h_policy.h` | 定义 Stage 分支、L1/UB 地址、槽位所有权和事件台账 | slot、Stage、producer/consumer | ready/free/terminal 状态 | 槽位复用必须先等待对应 free 或覆盖安全事件 |
+| `chunk_gated_delta_rule_fwd_h_utils.h` | 参数校验、state 布局寻址、GVA 映射、`required_hk_round` 规划 | `ApiInputs`、sequence/chunk id | `HostResult`、`RoundPlan` | 不读取未校验的 GM；不按整段 sequence 预留 kg |
+| `arch22/chunk_gated_delta_rule_fwd_h_cube.h` | arch22 的 Stage0/Stage2 Cube 伪代码 | H/W/k、当前 round 计划 | P、D、kg ready/free | Stage0 可异步预取 kg；Stage2 最后一次 MTE1 后释放 kg |
+| `arch22/chunk_gated_delta_rule_fwd_h_vec.h` | arch22 的 S-1/Stage1/Stage3 Vec 伪代码 | initial_state、u、P、D、门控 | H0、`V_new`、right、h、final_state | `V_new` 只保留到 S2 MTE1；无消费者的最终 chunk 不写 right |
+| `arch35/chunk_gated_delta_rule_fwd_h_cube.h` | A5 Cube 入口和架构替换点 | 与 arch22 相同 | 与 arch22 相同 | 当前用 arch22 契约占位，落地时替换 A5 指令/API |
+| `arch35/chunk_gated_delta_rule_fwd_h_vec.h` | A5 Vec 入口和 RegBase VF 替换点 | 与 arch22 相同 | 与 arch22 相同 | 当前用 arch22 契约占位，落地时替换 A5 指令/API |
+| `chunk_gated_delta_rule_fwd_h.cpp` | Host 适配、架构选择和 sequence -> round -> chunk 调度 | 框架 tensor、属性 | `(h, v_new, final_state)` | 下一 round 必须等上一 round 的 kg/H/W/异步搬运全部排空 |
 
 ## 精确的 round 绑定
 
@@ -52,7 +62,7 @@ head.wSlot   -> 当前 W L1 slot
 head.aiv/localSlot -> AIV 分配
 ```
 
-因此 g-only 的具体绑定为：
+具体 g-only 绑定示例：
 
 ```text
 HK=1, HV=3, round 0:
@@ -69,14 +79,13 @@ HK=2, HV=4, round 0:
       3       3   1     1    V_new_g[hv=3]
 ```
 
-Stage2 对表中每一行执行一次 MMAD。共享 `kh` 的两行复用当前 round 的 `kgSlot`，
+Stage2 对表中每一行执行一次 MMAD。共享 `kh` 的行复用当前 round 的 `kgSlot`，
 但仍使用各自不同的 H/value-head 右操作数。gk-only 将 `kh` 替换为 `hv`，因此每行
 都会得到独立的 `kgSlot`。
 
-Stage2 对准确的 `head.hv` 使用 `(kg[head.kgSlot], right[head.hSlot])`。因此 `HK:HV=1:3`
-生成 3 个 head binding 和 1 个 kg slot，`1:2` 生成 4 个 binding 和 2 个 kg slot，
-`1:6` 生成两个 round、每个 round 一个 kg slot；第二个 round 必须在第一个 round 排空后
-重新加载 kg。
+`HK:HV=1:3` 生成 3 个 head binding 和 1 个 kg slot，`1:2` 生成 4 个 binding 和 2 个
+kg slot，`1:6` 生成两个 round、每个 round 一个 kg slot；第二个 round 必须在第一个 round
+排空后重新加载 kg。
 
 固定的 L1 key 区域是 `[256, 320)` KiB，共 4 个、每个 16 KiB 的物理 slot。旧方案保留
 16 份会单独占用 `16 * 16 KiB = 256 KiB`，而设计还需要 W 的 64 KiB 和 H/resident 的
@@ -84,7 +93,7 @@ Stage2 对准确的 `head.hv` 使用 `(kg[head.kgSlot], right[head.hSlot])`。�
 而是只为当前 round 创建 `Nkg_round` 个 slot，在最后一个 S2 MTE1 消费者完成后释放，
 下一 round 需要时重新加载相同的 `kh`。
 
-## 时序控制骨架
+## 阶段和时序
 
 ```text
 对 sequence n：
@@ -98,13 +107,14 @@ Stage2 对准确的 `head.hv` 使用 `(kg[head.kgSlot], right[head.hSlot])`。�
         对 chunk c：
             plan = BuildRoundPlan(n, r, c)
             如果 plan.stage0Required：
-                Stage0：异步预取恰好 Nkg_round 个 kg slot，并计算 P
+                Stage0：异步预取恰好 Nkg_round 个 kg slot，并计算 P = W @ H
             Stage1：计算 V_new（仅在 S2 需要时计算 V_new_g/alpha）
             如果 plan.stage2Required：
                 Stage2：等待 kg/right，计算 MMAD D，在最后一次 MTE1 后释放 kg/right
                 Stage3：更新 state，写 h/final_state，发布下一个 H ready
             否则：
-                # final chunk 且 output_final_state=false：不加载 kg、不算 D、不更新 state、不写最终 GM
+                # final chunk 且 output_final_state=false：不加载 kg、不算 D、不更新 state
+                # 也不把 v_new-only 误写入没有消费者的 L1 右操作数区域
 ```
 
 `state_v_first=false` 将逻辑 state `[k,v]` 映射为 `base + k*V + v`；`true` 映射为

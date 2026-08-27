@@ -1,0 +1,23 @@
+// 仅伪代码。arch35（A5）Cube 阶段入口。
+// A5 的具体 MTE/Cube/Fixpipe API 在实现时核对；阶段契约与 arch22 保持一致。
+
+#pragma once
+
+#include "../arch22/chunk_gated_delta_rule_fwd_h_cube.h"
+
+namespace fwd_h_pseudocode {
+
+inline CubeStageResult RunStage0Arch35(const CubeStage0Args& args)
+{
+    // A5 仍在 Stage0 期间异步预取当前 round 的 kg，并在 S2 最后一次 MTE1 后释放。
+    // 这里复用相同的数据契约；真实实现替换为 arch35 的 Cube 指令和事件 API。
+    return RunStage0Arch22(args);
+}
+
+inline CubeStageResult RunStage2Arch35(const CubeStage2Args& args)
+{
+    // A5 的 Stage2 逐 head 执行 kg @ right 操作数，kg slot 只在本 round 内共享。
+    return RunStage2Arch22(args);
+}
+
+} // 命名空间 fwd_h_pseudocode
