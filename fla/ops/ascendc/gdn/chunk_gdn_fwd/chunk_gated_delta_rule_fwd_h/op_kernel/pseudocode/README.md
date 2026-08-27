@@ -30,7 +30,7 @@ op_kernel/
 | `arch22/chunk_gated_delta_rule_fwd_h_cube.h` | arch22 的 Stage0/Stage2 Cube 伪代码 | H/W/k、当前 round 计划 | P、D、kg ready/free | Stage0 只计算 P；Stage2 入口加载 kg，最后一次 MTE1 后释放 kg |
 | `arch22/chunk_gated_delta_rule_fwd_h_vec.h` | arch22 的 S-1/Stage1/Stage3 Vec 伪代码 | initial_state、u、P、D、门控 | H0、`V_new`、right、h、final_state | `V_new` 只保留到 S2 MTE1；无消费者的最终 chunk 不写 right |
 | `arch35/chunk_gated_delta_rule_fwd_h_cube.h` | A5 Cube 入口和架构替换点 | 与 arch22 相同 | 与 arch22 相同 | 当前用 arch22 契约占位，落地时替换 A5 指令/API |
-| `arch35/chunk_gated_delta_rule_fwd_h_vec.h` | A5 Vec 入口和 RegBase VF 替换点 | 与 arch22 相同 | 与 arch22 相同 | 当前用 arch22 契约占位，落地时替换 A5 指令/API |
+| `arch35/chunk_gated_delta_rule_fwd_h_vec.h` | A5 独立 Vec 实现；每个阶段一个 RegBase 完整 head VF | initial/u/P/D、门控、state | H0、`V_new`、right、h、final_state | 不包含 arch22 Vec；MTE2 完成后只进入本文件的单次 VF，MTE3 负责结果搬运 |
 | `chunk_gated_delta_rule_fwd_h.cpp` | Host 适配、架构选择和 sequence -> round -> chunk 调度 | 框架 tensor、属性 | `(h, v_new, final_state)` | 下一 round 必须等上一 round 的 kg/H/W/异步搬运全部排空 |
 
 ## Stage 内部模块
@@ -111,6 +111,22 @@ Vector 算术在 FP32 寄存器中完成，再按 StateT 量化。BF16 state 原
 state 只在 VF 期间占用 shared scratch，需跨 chunk 时通过 rolling GM 保存。FP32 分支在同一
 次 VF 中逐行读取 D，某行最后一次读取完成后才把该行固定低 32 KiB 子区交给 BF16 H 写者，
 不做 UB 搬移。
+
+### A5 RegBase VF 约束
+
+`arch35/chunk_gated_delta_rule_fwd_h_vec.h` 不再通过包装函数调用 arch22。三个入口的
+计算边界固定如下：
+
+| 入口 | MTE2 完成后唯一 VF | VF 外的 MTE3/事件 |
+| --- | --- | --- |
+| `RunSMinusOneArch35` | `SMinusOneFp32ToBf16Vf`：FP32 initial 转 canonical BF16 H0 | H0 同时写公开输出和 L1 resident，完成后发布 `HReady` |
+| `RunStage1Arch35` | `Stage1FullHeadVf`：`U-P`、BF16 `V_new`、g-only 的 `V_new_g/alpha`、首 chunk H0 | 写 `v_new`；有 S2 消费者才写 L1 right 并发布 `RightReady` |
+| `RunStage3Arch35` | `Stage3FullHeadVf`：gate(state)、`+D`、state 原位更新、下一 H 派生 | 非末 chunk 写 H/L1 并发布 `HReady`；末 chunk 按需写 `final_state` |
+
+VF 使用 `AscendC::Reg::RegTensor`、`MaskReg::UpdateMask`、`LoadAlign/StoreAlign` 和
+显式 FP32/BF16 mask；需要保护同一 UB 槽“先存后读”时使用 `LocalMemBar<VEC_STORE,VEC_LOAD>`。
+`state_v_first` 不进入寄存器转置，所有 state 的物理布局由 layout-aware MTE2/MTE3 描述符
+原生处理。
 
 ## 同步协议矩阵
 
