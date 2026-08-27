@@ -131,6 +131,26 @@ VF 使用 `AscendC::Reg::RegTensor`、`MaskReg::UpdateMask`、`LoadAlign/StoreAl
 `state_v_first` 不进入寄存器转置，所有 state 的物理布局由 layout-aware MTE2/MTE3 描述符
 原生处理。
 
+RegBase VF 的编译约束：
+
+- `Stage1FullHeadVf` 和 `Stage3FullHeadVf` 的 `HasP`、`ScalarG`、`WriteRight`、`WriteH0`、
+  `ZeroH0`、`StateT`、`GateT`、`UseExp2` 等分支状态全部是模板参数；VF 内只能出现
+  `if constexpr`，不能读取 tiling 的运行期布尔值做分支。
+- VF 内所有循环都使用 `for (uint16_t i = 0; i < repeatTimes; ++i)` 形式，起点为 0、步长为 1，
+  循环边界在进入循环后不修改；`repeatTimes` 在 VF 外计算并以 `uint16_t` 传入。
+- A5 同一 VF 的资源预算按昇腾 RegBase 约束管理：RegTensor 不超过 32 个、MaskReg 不超过 8 个、
+  AddrReg 不超过 8 个，UnalignRegForLoad/Store 各不超过 4 个。本伪代码给 Stage1 预留 12 个
+  RegTensor、Stage3 预留 10 个 RegTensor，并保留静态预算断言；落地时必须以编译器寄存器报告复核。
+- 编译配置保持指令双发开启，不使用关闭双发的选项；循环内减少数据依赖和无关标量指令，避免
+  双发条件被破坏。
+- VF 只能通过 `asc_vf_call` 进入，VF 内调用的 RegBase 辅助函数标记为 `__simd_callee__`；
+  `state_v_first` 仍由 GM layout-aware 搬运处理，不进入 VF 运行期分支。
+
+上述约束依据昇腾 Reg 矢量计算的 [VF 循环规范](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta2/opdevg/Ascendcopdevg/atlas_ascendc_best_practices_10_00023.html)、
+[RegBase 编程模型](https://www.hiascend.com/document/detail/zh/canncommercial/900/programug/Ascendcopdevg/atlas_ascendc_10_10071.html)
+、[指令双发优化说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta2/opdevg/Ascendcopdevg/atlas_ascendc_best_practices_10_00024.html)
+和[矢量计算指令双发及寄存器资源限制](https://gitcode.com/cann/asc-devkit/blob/master/docs/zh/guide/%E7%AE%97%E5%AD%90%E5%AE%9E%E8%B7%B5%E5%8F%82%E8%80%83/SIMD%E7%AE%97%E5%AD%90%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E7%9F%A2%E9%87%8F%E8%AE%A1%E7%AE%97/VF%E6%80%A7%E8%83%BD%E4%BC%98%E5%8C%96/%E6%8C%87%E4%BB%A4%E5%8F%8C%E5%8F%91%E4%BC%98%E5%8C%96.md)。
+
 ## 同步协议矩阵
 
 ### 单 Stage 内部

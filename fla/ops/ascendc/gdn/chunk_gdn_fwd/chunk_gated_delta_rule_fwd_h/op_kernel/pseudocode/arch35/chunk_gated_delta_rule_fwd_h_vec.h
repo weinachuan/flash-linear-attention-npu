@@ -57,37 +57,50 @@ constexpr uint32_t kFp32PerReg = kRegBytes / sizeof(float);
 constexpr uint32_t kBf16PerReg = kRegBytes / sizeof(bfloat16_t);
 constexpr uint32_t kStateElements = kKeyDim * kValueDim;
 constexpr float kLn2 = 0.6931471805599453f;
+// A5 RegBase 硬件资源上限；实际落地还需以编译器寄存器报告复核。
+constexpr uint16_t kMaxRegTensor = 32;
+constexpr uint16_t kMaxMaskReg = 8;
+constexpr uint16_t kMaxAddrReg = 8;
+constexpr uint16_t kMaxUnalignReg = 4;
+constexpr bool kDualIssueEnabled = true;
+constexpr uint16_t kSMinusOneRegTensorBudget = 2;
+constexpr uint16_t kStage1RegTensorBudget = 12;
+constexpr uint16_t kStage3RegTensorBudget = 10;
+static_assert(kSMinusOneRegTensorBudget <= kMaxRegTensor);
+static_assert(kStage1RegTensorBudget <= kMaxRegTensor);
+static_assert(kStage3RegTensorBudget <= kMaxRegTensor);
+static_assert(kDualIssueEnabled, "A5 VF 不得关闭指令双发");
 
-inline void RegBaseCastFp32ToBf16(AscendC::Reg::RegTensor<bfloat16_t>& dst,
-                                  AscendC::Reg::RegTensor<float>& src,
-                                  AscendC::Reg::MaskReg& mask)
+__simd_callee__ inline void RegBaseCastFp32ToBf16(AscendC::Reg::RegTensor<bfloat16_t>& dst,
+                                                 AscendC::Reg::RegTensor<float>& src,
+                                                 AscendC::Reg::MaskReg& mask)
 {
     // 伪代码：对应目标 CANN 的 Reg::Cast FP32 -> BF16 重载。
     AscendC::Reg::Cast(dst, src, mask);
 }
 
-inline void RegBaseCastBf16ToFp32(AscendC::Reg::RegTensor<float>& dst,
-                                  AscendC::Reg::RegTensor<bfloat16_t>& src,
-                                  AscendC::Reg::MaskReg& mask)
+__simd_callee__ inline void RegBaseCastBf16ToFp32(AscendC::Reg::RegTensor<float>& dst,
+                                                 AscendC::Reg::RegTensor<bfloat16_t>& src,
+                                                 AscendC::Reg::MaskReg& mask)
 {
     // 伪代码：对应目标 CANN 的 Reg::Cast BF16 -> FP32 重载。
     AscendC::Reg::Cast(dst, src, mask);
 }
 
-inline void RegBaseLoadGate(AscendC::Reg::RegTensor<float>& gate,
-                            __ubuf__ const float* gateUb,
-                            uint32_t tokenIndex,
-                            AscendC::Reg::MaskReg& mask)
+__simd_callee__ inline void RegBaseLoadGate(AscendC::Reg::RegTensor<float>& gate,
+                                           __ubuf__ const float* gateUb,
+                                           uint32_t tokenIndex,
+                                           AscendC::Reg::MaskReg& mask)
 {
     // g 是每 token 一个标量；RegBase 通过加载加广播扩展到该 token 的 V 维。
     AscendC::Reg::LoadAlign(gate, gateUb + tokenIndex);
     AscendC::Reg::Duplicate(gate, gate[0], mask);
 }
 
-inline void RegBaseLoadGkLast(AscendC::Reg::RegTensor<float>& gk,
-                              __ubuf__ const float* gkUb,
-                              uint32_t keyIndex,
-                              AscendC::Reg::MaskReg& mask)
+__simd_callee__ inline void RegBaseLoadGkLast(AscendC::Reg::RegTensor<float>& gk,
+                                             __ubuf__ const float* gkUb,
+                                             uint32_t keyIndex,
+                                             AscendC::Reg::MaskReg& mask)
 {
     // state 的 canonical 顺序是 [K,V]，所以每个 K 行复用一个 gk[M-1,k] 标量。
     // 尾 chunk 的无效 token 已由 MTE2 清零；这里用 RegBase 广播到该 K 行的 V 元素。
@@ -95,42 +108,39 @@ inline void RegBaseLoadGkLast(AscendC::Reg::RegTensor<float>& gk,
     AscendC::Reg::Duplicate(gk, gk[0], mask);
 }
 
-inline void RegBaseLoadAlpha(AscendC::Reg::RegTensor<float>& alpha,
-                             __ubuf__ const float* alphaUb,
-                             AscendC::Reg::MaskReg& mask)
+__simd_callee__ inline void RegBaseLoadAlpha(AscendC::Reg::RegTensor<float>& alpha,
+                                            __ubuf__ const float* alphaUb,
+                                            AscendC::Reg::MaskReg& mask)
 {
     // alpha 是每个 head 一个标量，Stage3 对整个 [K,V] 广播同一个 lambda。
     AscendC::Reg::LoadAlign(alpha, alphaUb);
     AscendC::Reg::Duplicate(alpha, alpha[0], mask);
 }
 
-inline void RegBaseApplyGateDelta(AscendC::Reg::RegTensor<float>& value,
-                                  AscendC::Reg::RegTensor<float>& gate,
-                                  bool useExp2,
-                                  AscendC::Reg::MaskReg& mask)
+template <bool UseExp2>
+__simd_callee__ inline void RegBaseApplyGateDelta(AscendC::Reg::RegTensor<float>& value,
+                                                 AscendC::Reg::RegTensor<float>& gate,
+                                                 AscendC::Reg::RegTensor<float>& gLast,
+                                                 AscendC::Reg::MaskReg& mask)
 {
-    // 伪代码：按 use_exp2 选择 exp/exp2，计算 value *= (1 - exp(g))。
+    // 伪代码：计算 value *= E(g_last-g_i)，并在编译期按 UseExp2 选择 exp/exp2。
     // 这些 Reg 算子必须在同一 VF 内完成，不能拆成额外的 vector pass。
-    AscendC::Reg::RegTensor<float> one;
     AscendC::Reg::RegTensor<float> decay;
-    AscendC::Reg::Duplicate(one, 1.0f, mask);
-    if (useExp2) {
-        AscendC::Reg::Muls(gate, gate, kLn2, mask);
-        AscendC::Reg::Exp(decay, gate, mask);
-    } else {
-        AscendC::Reg::Exp(decay, gate, mask);
+    AscendC::Reg::Sub(decay, gLast, gate, mask);
+    if constexpr (UseExp2) {
+        AscendC::Reg::Muls(decay, decay, kLn2, mask);
     }
-    AscendC::Reg::Sub(decay, one, decay, mask);
+    AscendC::Reg::Exp(decay, decay, mask);
     AscendC::Reg::Mul(value, value, decay, mask);
 }
 
-inline void RegBaseApplyStateGate(AscendC::Reg::RegTensor<float>& state,
-                                  AscendC::Reg::RegTensor<float>& gate,
-                                  bool useExp2,
-                                  AscendC::Reg::MaskReg& mask)
+template <bool UseExp2>
+__simd_callee__ inline void RegBaseApplyStateGate(AscendC::Reg::RegTensor<float>& state,
+                                                 AscendC::Reg::RegTensor<float>& gate,
+                                                 AscendC::Reg::MaskReg& mask)
 {
-    // Stage3 使用 lambda = exp(g_last)，不是 Stage1 的 delta = 1 - exp(g)。
-    if (useExp2) {
+    // Stage3 使用 lambda = E(g_last)；Stage1 的 g-only 右操作数使用相对衰减 E(g_last-g_i)。
+    if constexpr (UseExp2) {
         AscendC::Reg::Muls(gate, gate, kLn2, mask);
         AscendC::Reg::Exp(gate, gate, mask);
     } else {
@@ -139,48 +149,59 @@ inline void RegBaseApplyStateGate(AscendC::Reg::RegTensor<float>& state,
     AscendC::Reg::Mul(state, state, gate, mask);
 }
 
-inline void RegBaseApplyStateScale(AscendC::Reg::RegTensor<float>& state,
-                                   AscendC::Reg::RegTensor<float>& alpha,
-                                   AscendC::Reg::MaskReg& mask)
+__simd_callee__ inline void RegBaseApplyStateScale(AscendC::Reg::RegTensor<float>& state,
+                                                  AscendC::Reg::RegTensor<float>& alpha,
+                                                  AscendC::Reg::MaskReg& mask)
 {
     // g-only 的 alpha 已在 Stage1 VF 中变成 lambda，Stage3 不能再次做 exp。
     AscendC::Reg::Mul(state, state, alpha, mask);
 }
 
-inline void RegBaseWriteLastAlpha(__ubuf__ float* alphaUb,
-                                  __ubuf__ const float* gateUb,
-                                  uint32_t validTokens,
-                                  bool useExp2)
+template <bool UseExp2>
+__simd_callee__ inline void RegBaseWriteAlphaScalar(__ubuf__ float* alphaUb,
+                                                   __ubuf__ const float* gateUb)
+{
+    // alpha_c = E(g_last)，只写一个 FP32 标量；UseExp2 在编译期确定指数实现。
+    AscendC::Reg::RegTensor<float> alphaReg;
+    auto mask = AscendC::Reg::UpdateMask<float>(1);
+    AscendC::Reg::LoadAlign(alphaReg, gateUb);
+    if constexpr (UseExp2) {
+        AscendC::Reg::Muls(alphaReg, alphaReg, kLn2, mask);
+    }
+    AscendC::Reg::Exp(alphaReg, alphaReg, mask);
+    AscendC::Reg::StoreAlign(alphaUb, alphaReg, mask);
+}
+
+template <bool UseExp2>
+__simd_callee__ inline void RegBaseWriteLastAlpha(__ubuf__ float* alphaUb,
+                                                 __ubuf__ const float* gateUb,
+                                                 uint32_t validTokens)
 {
     // alpha 仅供同一 head 的 S3 使用，按最后有效 token 写入一个 FP32 标量。
-    RegBaseWriteAlphaScalar(alphaUb, gateUb + validTokens - 1, useExp2);
+    RegBaseWriteAlphaScalar<UseExp2>(alphaUb, gateUb + validTokens - 1);
 }
 
 // S-1 的唯一 VF：FP32 initial -> BF16 H0。内部始终按 canonical [K,V] 处理。
 __simd_vf__ inline void SMinusOneFp32ToBf16Vf(__ubuf__ const float* srcUb,
                                               __ubuf__ bfloat16_t* dstUb,
                                               uint32_t elementCount,
-                                              bool stateVFirst)
+                                              uint16_t repeatTimes)
 {
     // S-1 VF 公式：H_0,h = cast_BF16(R_0,h)，R_0,h 为 FP32 canonical [K,V]；state_v_first 只影响 GM 布局。
-    uint32_t remaining = elementCount;
-    uint32_t offset = 0;
-    while (remaining > 0) {
-        auto fp32Mask = AscendC::Reg::UpdateMask<float>(remaining);
+    for (uint16_t i = 0; i < repeatTimes; ++i) {
+        const uint32_t offset = static_cast<uint32_t>(i) * kFp32PerReg;
+        auto fp32Mask = AscendC::Reg::UpdateMask<float>(elementCount - offset);
         AscendC::Reg::RegTensor<float> srcReg;
         AscendC::Reg::RegTensor<bfloat16_t> dstReg;
         AscendC::Reg::LoadAlign(srcReg, srcUb + offset);
         RegBaseCastFp32ToBf16(dstReg, srcReg, fp32Mask);
-        auto bf16Mask = AscendC::Reg::CreateMask<bfloat16_t>();
+        auto bf16Mask = AscendC::Reg::UpdateMask<bfloat16_t>(elementCount - offset);
         AscendC::Reg::StoreAlign(dstUb + offset, dstReg, bf16Mask);
-        offset += kFp32PerReg;
-        remaining = remaining > kFp32PerReg ? remaining - kFp32PerReg : 0;
     }
-    // state_v_first 只由 MTE3 layout-aware 描述符处理，VF 内不做转置。
-    (void)stateVFirst;
 }
 
 // Stage1 的唯一 VF：U-P、BF16 转换、g/gk 分支派生、alpha，以及首 chunk H0。
+template <bool HasP, bool ScalarG, bool WriteRight, bool WriteH0, bool ZeroH0, bool UseExp2>
 __simd_vf__ inline void Stage1FullHeadVf(
     __ubuf__ const bfloat16_t* uUb,
     __ubuf__ const float* pUb,
@@ -192,38 +213,38 @@ __simd_vf__ inline void Stage1FullHeadVf(
     __ubuf__ float* alphaUb,
     __ubuf__ bfloat16_t* h0Ub,
     uint32_t validTokens,
-    bool hasP,
-    bool scalarG,
-    bool writeRight,
-    bool writeH0,
-    bool zeroH0,
-    bool useExp2)
+    uint16_t repeatTimes)
 {
-    // Stage1 VF 公式：V_new_fp32,c,h = fp32(U_c,h) - fp32(P_c,h)，V_new_c,h = cast_BF16(V_new_fp32,c,h)；hasP=false 时 P_c,h=0。
-    // g-only 额外计算 V_new_g,c,h[i,:] = cast_BF16(E(g_last-g_i) * V_new_fp32,c,h[i,:])；E 由 useExp2 决定。
-    if (writeH0) {
-        uint32_t stateRemaining = kStateElements;
-        uint32_t stateOffset = 0;
-        while (stateRemaining > 0) {
-            auto stateMask = AscendC::Reg::UpdateMask<bfloat16_t>(stateRemaining);
+    // Stage1 VF 公式：V_new_fp32,c,h = fp32(U_c,h) - fp32(P_c,h)，V_new_c,h = cast_BF16(V_new_fp32,c,h)；HasP=false 时 P_c,h=0。
+    // ScalarG 且 WriteRight 时额外计算 V_new_g,c,h[i,:] = cast_BF16(E(g_last-g_i) * V_new_fp32,c,h[i,:])；E 由 UseExp2 决定。
+    const uint32_t elementCount = validTokens * kValueDim;
+    AscendC::Reg::RegTensor<float> gLastReg;
+    if constexpr (WriteRight && ScalarG) {
+        auto gLastMask = AscendC::Reg::CreateMask<float>();
+        RegBaseLoadGate(gLastReg, gateUb, validTokens - 1, gLastMask);
+    }
+    if constexpr (WriteH0) {
+        constexpr uint16_t stateRepeatTimes = static_cast<uint16_t>(
+            (kStateElements + kBf16PerReg - 1) / kBf16PerReg);
+        for (uint16_t i = 0; i < stateRepeatTimes; ++i) {
+            const uint32_t stateOffset = static_cast<uint32_t>(i) * kBf16PerReg;
+            auto stateMask = AscendC::Reg::UpdateMask<bfloat16_t>(
+                kStateElements - stateOffset);
             AscendC::Reg::RegTensor<bfloat16_t> stateReg;
-            if (zeroH0) {
+            if constexpr (ZeroH0) {
                 AscendC::Reg::Duplicate(stateReg, static_cast<bfloat16_t>(0), stateMask);
             } else {
                 AscendC::Reg::LoadAlign(stateReg, initialStateUb + stateOffset);
             }
             AscendC::Reg::StoreAlign(h0Ub + stateOffset, stateReg, stateMask);
-            stateOffset += kBf16PerReg;
-            stateRemaining = stateRemaining > kBf16PerReg
-                                 ? stateRemaining - kBf16PerReg : 0;
         }
     }
 
-    uint32_t remaining = validTokens * kValueDim;
-    uint32_t offset = 0;
-    while (remaining > 0) {
+    for (uint16_t i = 0; i < repeatTimes; ++i) {
+        const uint32_t offset = static_cast<uint32_t>(i) * kFp32PerReg;
+        const uint32_t remaining = elementCount - offset;
         auto bf16Mask = AscendC::Reg::UpdateMask<bfloat16_t>(remaining);
-        auto fp32Mask = AscendC::Reg::CreateMask<float>();
+        auto fp32Mask = AscendC::Reg::UpdateMask<float>(remaining);
         AscendC::Reg::RegTensor<bfloat16_t> uBf16;
         AscendC::Reg::RegTensor<float> uFp32;
         AscendC::Reg::RegTensor<float> pFp32;
@@ -231,7 +252,7 @@ __simd_vf__ inline void Stage1FullHeadVf(
         AscendC::Reg::RegTensor<bfloat16_t> vBf16;
         AscendC::Reg::LoadAlign(uBf16, uUb + offset);
         RegBaseCastBf16ToFp32(uFp32, uBf16, bf16Mask);
-        if (hasP) {
+        if constexpr (HasP) {
             AscendC::Reg::LoadAlign(pFp32, pUb + offset);
         } else {
             AscendC::Reg::Duplicate(pFp32, 0.0f, fp32Mask);
@@ -241,24 +262,23 @@ __simd_vf__ inline void Stage1FullHeadVf(
         RegBaseCastFp32ToBf16(vBf16, vFp32, fp32Mask);
         AscendC::Reg::StoreAlign(vNewBf16Ub + offset, vBf16, bf16Mask);
 
-        if (writeRight) {
-            if (scalarG) {
+        if constexpr (WriteRight) {
+            if constexpr (ScalarG) {
                 AscendC::Reg::RegTensor<float> gateReg;
                 RegBaseLoadGate(gateReg, gateUb, offset / kValueDim, fp32Mask);
-                RegBaseApplyGateDelta(vFp32, gateReg, useExp2, fp32Mask);
+                RegBaseApplyGateDelta<UseExp2>(vFp32, gateReg, gLastReg, fp32Mask);
                 RegBaseCastFp32ToBf16(vBf16, vFp32, fp32Mask);
             }
             AscendC::Reg::StoreAlign(rightBf16Ub + offset, vBf16, bf16Mask);
         }
-        offset += kFp32PerReg;
-        remaining = remaining > kFp32PerReg ? remaining - kFp32PerReg : 0;
     }
-    if (writeRight && scalarG) {
-        RegBaseWriteLastAlpha(alphaUb, gateUb, validTokens, useExp2);
+    if constexpr (WriteRight && ScalarG) {
+        RegBaseWriteLastAlpha<UseExp2>(alphaUb, gateUb, validTokens);
     }
 }
 
 // Stage3 的唯一 VF：gate(state)、加 D、状态写回和下一 H 的 BF16 派生。
+template <StateType StateT, GateMode GateT, bool WriteHNext, bool UseExp2>
 __simd_vf__ inline void Stage3FullHeadVf(
     __ubuf__ bfloat16_t* stateBf16Ub,
     __ubuf__ float* stateFp32Ub,
@@ -267,25 +287,21 @@ __simd_vf__ inline void Stage3FullHeadVf(
     __ubuf__ const float* gkLastUb,
     __ubuf__ bfloat16_t* hNextUb,
     uint32_t elementCount,
-    StateType stateType,
-    GateMode gateMode,
-    bool writeHNext,
-    bool useExp2,
-    bool stateVFirst)
+    uint16_t repeatTimes)
 {
     // Stage3 VF 公式：R_{c+1,h} = gate(R_c,h) + D_c,h，非末 chunk 再生成 H_{c+1,h} = cast_BF16(R_{c+1,h})。
-    // g-only 的 gate 为 alpha_c = E(g_last)，gk-only 的 gate 为 E(gk_c,h[M-1,:])；E 由 useExp2 决定。
-    uint32_t remaining = elementCount;
-    uint32_t offset = 0;
-    while (remaining > 0) {
+    // GateT=ScalarG 时 gate 为 alpha_c = E(g_last)，否则为 E(gk_c,h[M-1,:])；E 由 UseExp2 决定。
+    for (uint16_t i = 0; i < repeatTimes; ++i) {
+        const uint32_t offset = static_cast<uint32_t>(i) * kFp32PerReg;
+        const uint32_t remaining = elementCount - offset;
         auto fp32Mask = AscendC::Reg::UpdateMask<float>(remaining);
-        auto bf16Mask = AscendC::Reg::CreateMask<bfloat16_t>();
+        auto bf16Mask = AscendC::Reg::UpdateMask<bfloat16_t>(remaining);
         AscendC::Reg::RegTensor<float> stateReg;
         AscendC::Reg::RegTensor<float> dReg;
         AscendC::Reg::RegTensor<float> gateReg;
         AscendC::Reg::RegTensor<float> resultReg;
         AscendC::Reg::RegTensor<bfloat16_t> resultBf16;
-        if (stateType == StateType::Bf16) {
+        if constexpr (StateT == StateType::Bf16) {
             AscendC::Reg::RegTensor<bfloat16_t> stateBf16;
             AscendC::Reg::LoadAlign(stateBf16, stateBf16Ub + offset);
             RegBaseCastBf16ToFp32(stateReg, stateBf16, bf16Mask);
@@ -293,33 +309,168 @@ __simd_vf__ inline void Stage3FullHeadVf(
             AscendC::Reg::LoadAlign(stateReg, stateFp32Ub + offset);
         }
         AscendC::Reg::LoadAlign(dReg, dUb + offset);
-        if (gateMode == GateMode::ScalarG) {
+        if constexpr (GateT == GateMode::ScalarG) {
             RegBaseLoadAlpha(gateReg, alphaUb, fp32Mask);
             RegBaseApplyStateScale(stateReg, gateReg, fp32Mask);
         } else {
             RegBaseLoadGkLast(gateReg, gkLastUb, offset / kValueDim, fp32Mask);
-            RegBaseApplyStateGate(stateReg, gateReg, useExp2, fp32Mask);
+            RegBaseApplyStateGate<UseExp2>(stateReg, gateReg, fp32Mask);
         }
         AscendC::Reg::Add(resultReg, stateReg, dReg, fp32Mask);
-        if (stateType == StateType::Bf16) {
+        if constexpr (StateT == StateType::Bf16) {
             RegBaseCastFp32ToBf16(resultBf16, resultReg, fp32Mask);
             AscendC::Reg::StoreAlign(stateBf16Ub + offset, resultBf16, bf16Mask);
-            if (writeHNext) {
+            if constexpr (WriteHNext) {
                 AscendC::Reg::StoreAlign(hNextUb + offset, resultBf16, bf16Mask);
             }
         } else {
             AscendC::Reg::StoreAlign(stateFp32Ub + offset, resultReg, fp32Mask);
-            if (writeHNext) {
+            if constexpr (WriteHNext) {
                 RegBaseCastFp32ToBf16(resultBf16, resultReg, fp32Mask);
                 AscendC::Reg::StoreAlign(hNextUb + offset, resultBf16, bf16Mask);
             }
         }
-        offset += kFp32PerReg;
-        remaining = remaining > kFp32PerReg ? remaining - kFp32PerReg : 0;
     }
     // 仅用于保护 VF 内同一 UB 槽的先存后读；MTE2/MTE3 依赖由外层事件负责。
     LocalMemBar<VEC_STORE, VEC_LOAD>();
-    (void)stateVFirst;
+}
+
+// VF 外的运行期 dispatch：只负责把 tiling/分支状态映射为模板参数，绝不把运行期 if 带入 VF。
+struct Stage1VfCall {
+    __ubuf__ const bfloat16_t* uUb;
+    __ubuf__ const float* pUb;
+    __ubuf__ const float* gateUb;
+    __ubuf__ const bfloat16_t* initialStateUb;
+    __ubuf__ float* vNewFp32Ub;
+    __ubuf__ bfloat16_t* vNewBf16Ub;
+    __ubuf__ bfloat16_t* rightBf16Ub;
+    __ubuf__ float* alphaUb;
+    __ubuf__ bfloat16_t* h0Ub;
+    uint32_t validTokens;
+    uint16_t repeatTimes;
+};
+
+template <bool UseExp2, bool HasP, bool ScalarG, bool WriteRight>
+inline void DispatchStage1H0(const Stage1VfCall& call, bool writeH0, bool zeroH0)
+{
+    // 这里位于 VF 外，运行期 if 只选择已经实例化的 VF，不参与向量循环。
+    if (writeH0) {
+        if (zeroH0) {
+            asc_vf_call<Stage1FullHeadVf<HasP, ScalarG, WriteRight, true, true, UseExp2>>(
+                call.uUb, call.pUb, call.gateUb, call.initialStateUb, call.vNewFp32Ub,
+                call.vNewBf16Ub, call.rightBf16Ub, call.alphaUb, call.h0Ub,
+                call.validTokens, call.repeatTimes);
+        } else {
+            asc_vf_call<Stage1FullHeadVf<HasP, ScalarG, WriteRight, true, false, UseExp2>>(
+                call.uUb, call.pUb, call.gateUb, call.initialStateUb, call.vNewFp32Ub,
+                call.vNewBf16Ub, call.rightBf16Ub, call.alphaUb, call.h0Ub,
+                call.validTokens, call.repeatTimes);
+        }
+    } else {
+        asc_vf_call<Stage1FullHeadVf<HasP, ScalarG, WriteRight, false, false, UseExp2>>(
+            call.uUb, call.pUb, call.gateUb, call.initialStateUb, call.vNewFp32Ub,
+            call.vNewBf16Ub, call.rightBf16Ub, call.alphaUb, call.h0Ub,
+            call.validTokens, call.repeatTimes);
+    }
+}
+
+template <bool UseExp2, bool HasP, bool ScalarG>
+inline void DispatchStage1Right(const Stage1VfCall& call, bool writeRight,
+                                bool writeH0, bool zeroH0)
+{
+    if (writeRight) {
+        DispatchStage1H0<UseExp2, HasP, ScalarG, true>(call, writeH0, zeroH0);
+    } else {
+        DispatchStage1H0<UseExp2, HasP, ScalarG, false>(call, writeH0, zeroH0);
+    }
+}
+
+template <bool HasP, bool ScalarG>
+inline void DispatchStage1ExpMode(const Stage1VfCall& call, bool useExp2,
+                                  bool writeRight, bool writeH0, bool zeroH0)
+{
+    if (useExp2) {
+        DispatchStage1Right<true, HasP, ScalarG>(call, writeRight, writeH0, zeroH0);
+    } else {
+        DispatchStage1Right<false, HasP, ScalarG>(call, writeRight, writeH0, zeroH0);
+    }
+}
+
+template <bool HasP>
+inline void DispatchStage1Gate(const Stage1VfCall& call, bool scalarG, bool useExp2,
+                               bool writeRight, bool writeH0, bool zeroH0)
+{
+    if (scalarG) {
+        DispatchStage1ExpMode<HasP, true>(call, useExp2, writeRight, writeH0, zeroH0);
+    } else {
+        DispatchStage1ExpMode<HasP, false>(call, useExp2, writeRight, writeH0, zeroH0);
+    }
+}
+
+inline void DispatchStage1Vf(const Stage1VfCall& call, bool hasP, bool scalarG, bool useExp2,
+                             bool writeRight, bool writeH0, bool zeroH0)
+{
+    if (hasP) {
+        DispatchStage1Gate<true>(call, scalarG, useExp2, writeRight, writeH0, zeroH0);
+    } else {
+        DispatchStage1Gate<false>(call, scalarG, useExp2, writeRight, writeH0, zeroH0);
+    }
+}
+
+struct Stage3VfCall {
+    __ubuf__ bfloat16_t* stateBf16Ub;
+    __ubuf__ float* stateFp32Ub;
+    __ubuf__ const float* dUb;
+    __ubuf__ const float* alphaUb;
+    __ubuf__ const float* gkLastUb;
+    __ubuf__ bfloat16_t* hNextUb;
+    uint32_t elementCount;
+    uint16_t repeatTimes;
+};
+
+template <StateType StateT, GateMode GateT, bool UseExp2>
+inline void DispatchStage3WriteH(const Stage3VfCall& call, bool writeHNext)
+{
+    if (writeHNext) {
+        asc_vf_call<Stage3FullHeadVf<StateT, GateT, true, UseExp2>>(
+            call.stateBf16Ub, call.stateFp32Ub, call.dUb, call.alphaUb, call.gkLastUb,
+            call.hNextUb, call.elementCount, call.repeatTimes);
+    } else {
+        asc_vf_call<Stage3FullHeadVf<StateT, GateT, false, UseExp2>>(
+            call.stateBf16Ub, call.stateFp32Ub, call.dUb, call.alphaUb, call.gkLastUb,
+            call.hNextUb, call.elementCount, call.repeatTimes);
+    }
+}
+
+template <StateType StateT, bool UseExp2>
+inline void DispatchStage3Gate(const Stage3VfCall& call, GateMode gateMode, bool writeHNext)
+{
+    if (gateMode == GateMode::ScalarG) {
+        DispatchStage3WriteH<StateT, GateMode::ScalarG, UseExp2>(call, writeHNext);
+    } else {
+        DispatchStage3WriteH<StateT, GateMode::KeyWiseGk, UseExp2>(call, writeHNext);
+    }
+}
+
+template <bool UseExp2>
+inline void DispatchStage3State(const Stage3VfCall& call, StateType stateType,
+                                GateMode gateMode, bool writeHNext)
+{
+    if (stateType == StateType::Bf16) {
+        DispatchStage3Gate<StateType::Bf16, UseExp2>(call, gateMode, writeHNext);
+    } else {
+        DispatchStage3Gate<StateType::Fp32, UseExp2>(call, gateMode, writeHNext);
+    }
+}
+
+inline void DispatchStage3Vf(const Stage3VfCall& call, StateType stateType, GateMode gateMode,
+                             bool writeHNext, bool useExp2)
+{
+    if (useExp2) {
+        DispatchStage3State<true>(call, stateType, gateMode, writeHNext);
+    } else {
+        DispatchStage3State<false>(call, stateType, gateMode, writeHNext);
+    }
 }
 
 } // namespace a5_regbase
@@ -350,11 +501,13 @@ inline void A5SMinusOneConvertAndWriteH0(const SMinusOneArgs& args,
     args.memory->AcquireInitialHOutput(head);
     args.memory->ProduceInitialH(head.hSlot);
     // A5 S-1 的 vector 计算只有这一处 VF 调用。
-    a5_regbase::SMinusOneFp32ToBf16Vf(
+    constexpr uint32_t elementCount = a5_regbase::kStateElements;
+    constexpr uint16_t repeatTimes = static_cast<uint16_t>(
+        (elementCount + a5_regbase::kFp32PerReg - 1) / a5_regbase::kFp32PerReg);
+    asc_vf_call<a5_regbase::SMinusOneFp32ToBf16Vf>(
         UbInitialInputRaw(*args.memory, head),
         UbInitialHOutputRaw(*args.memory, head),
-        a5_regbase::kStateElements,
-        args.tiling->stateLayout == StateLayout::VK);
+        elementCount, repeatTimes);
     PipeBarrierVForA5RegBase();
     args.memory->ReleaseInitialInput(head);
     args.sync->Release(EventKind::InitialInputFree, bank, /*S-1 VF*/ 1);
@@ -482,13 +635,16 @@ inline void A5Stage1ComputeAndWrite(const VecStageArgs& args, const HeadBinding&
                                        ? UbH0ScratchRaw(*args.memory, head)
                                        : UbBf16StateRaw(*args.memory, head))
                                 : nullptr;
-    const auto* h0Target = writeFp32ZeroH0
-                               ? UbH0WriteTargetRaw(*args.memory, head)
-                               : (plan.finalVNewOnly ? UbH0ScratchRaw(*args.memory, head)
-                                                     : UbBf16StateRaw(*args.memory, head));
+    auto* h0Target = writeFp32ZeroH0
+                         ? UbH0WriteTargetRaw(*args.memory, head)
+                         : (plan.finalVNewOnly ? UbH0ScratchRaw(*args.memory, head)
+                                               : UbBf16StateRaw(*args.memory, head));
 
-    // A5 Stage1 的所有 vector 计算集中在一个完整 head VF。
-    a5_regbase::Stage1FullHeadVf(
+    // A5 Stage1 的所有 vector 计算集中在一个完整 head VF；运行期状态在 VF 外完成模板 dispatch。
+    const uint32_t elementCount = plan.chunk.validTokens * kValueDim;
+    const uint16_t repeatTimes = static_cast<uint16_t>(
+        (elementCount + a5_regbase::kFp32PerReg - 1) / a5_regbase::kFp32PerReg);
+    const a5_regbase::Stage1VfCall vfCall{
         UbUbf16Raw(*args.memory, head),
         hasP ? UbPRaw(*args.memory, head) : nullptr,
         scalarG ? UbGateRaw(*args.memory, head) : nullptr,
@@ -498,8 +654,10 @@ inline void A5Stage1ComputeAndWrite(const VecStageArgs& args, const HeadBinding&
         writeRight ? UbRightBf16Raw(*args.memory, head) : nullptr,
         scalarG ? UbAlphaRaw(*args.memory, head) : nullptr,
         writeH0 ? h0Target : nullptr,
-        plan.chunk.validTokens, hasP, scalarG, writeRight, writeH0, zeroH0,
-        args.tiling->useExp2);
+        plan.chunk.validTokens,
+        repeatTimes};
+    a5_regbase::DispatchStage1Vf(vfCall, hasP, scalarG, args.tiling->useExp2,
+                                 writeRight, writeH0, zeroH0);
     PipeBarrierVForA5RegBase();
 
     write_v_new_from_ub(*args.out, plan.chunk, head.hv,
@@ -631,8 +789,11 @@ inline void A5Stage3ComputeAndWrite(const VecStage3Args& args,
                         /*S3 VF*/ 3);
     }
 
-    // A5 Stage3 的 gate、D、状态更新、H 派生全部由一个 RegBase VF 完成。
-    a5_regbase::Stage3FullHeadVf(
+    // A5 Stage3 的 gate、D、状态更新、H 派生全部由一个 RegBase VF 完成；运行期状态在 VF 外 dispatch。
+    constexpr uint32_t elementCount = a5_regbase::kStateElements;
+    constexpr uint16_t repeatTimes = static_cast<uint16_t>(
+        (elementCount + a5_regbase::kFp32PerReg - 1) / a5_regbase::kFp32PerReg);
+    const a5_regbase::Stage3VfCall vfCall{
         args.tiling->stateType == StateType::Bf16
             ? UbBf16StateRaw(*args.memory, head) : nullptr,
         args.tiling->stateType == StateType::Fp32
@@ -641,9 +802,10 @@ inline void A5Stage3ComputeAndWrite(const VecStage3Args& args,
         plan.gateMode == GateMode::ScalarG ? UbAlphaRaw(*args.memory, head) : nullptr,
         plan.gateMode == GateMode::KeyWiseGk ? UbGkLastRaw(*args.memory, head) : nullptr,
         plan.chunk.last ? nullptr : UbHWriteTargetRaw(*args.memory, head),
-        a5_regbase::kStateElements, args.tiling->stateType, plan.gateMode,
-        !plan.chunk.last, args.tiling->useExp2,
-        args.tiling->stateLayout == StateLayout::VK);
+        elementCount,
+        repeatTimes};
+    a5_regbase::DispatchStage3Vf(vfCall, args.tiling->stateType, plan.gateMode,
+                                 !plan.chunk.last, args.tiling->useExp2);
     PipeBarrierVForA5RegBase();
 
     if (!plan.chunk.last) {
