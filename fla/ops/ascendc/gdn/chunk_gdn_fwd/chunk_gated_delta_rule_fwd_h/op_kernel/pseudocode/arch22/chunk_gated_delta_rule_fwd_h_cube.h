@@ -28,39 +28,10 @@ struct CubeStage2Args {
 struct CubeStageResult {
     bool produced = false;
     int activeTaskCount = 0;
-    int kgPrefetchCount = 0;
+    int kgLoadCount = 0;
 };
 
 // ------------------------------- Stage 0 helpers -------------------------------
-
-inline void Stage0PrefetchKgAsync(const CubeStage0Args& args)
-{
-    const RoundPlan& plan = *args.plan;
-    if (!plan.stage2Required) {
-        // 最终 chunk 且不输出 final_state 时，S2 不存在，不为无消费者的 kg 发起搬运。
-        return;
-    }
-
-    for (int i = 0; i < plan.requiredKhCount; ++i) {
-        const kg_binding& binding = plan.kg[i];
-        auto& ticket = args.memory->kg[binding.slot];
-
-        // 本 chunk/round 的 slot 只能在上一代最后一个 S2 MTE1 完成后覆写。
-        if (ticket.generation > 0 && !plan.roundBoundaryDrained) {
-            args.sync->Wait(EventKind::kg_overwrite_safe, binding.slot,
-                            /*当前 Stage0 的 MTE2 生产者*/ 0);
-        }
-        args.memory->acquire_kg(binding.slot);
-
-        // 先把整个 16 KiB entry 置零，再只覆盖 M 个有效 token；尾部不读取 GM padding。
-        Mte2InitConstValueAsync(l1_kg(args.memory->l1, binding.slot), /*zero*/ 0,
-                                /*bytes*/ 16 * 1024);
-        Mte2CopyValidRowsAsync(
-            /*源=*/KeyPayload(*args.in, plan.chunk, binding.kh, binding.payload),
-            /*目的=*/l1_kg(args.memory->l1, binding.slot), plan.chunk.validTokens);
-        // 这里故意不 wait_mte2_done：kg 在 S1 期间保持 Loading，S2 的首个消费者负责等待。
-    }
-}
 
 inline void Stage0LoadH(const CubeStage0Args& args, const HeadBinding& head)
 {
@@ -148,8 +119,6 @@ inline CubeStageResult RunStage0Arch22(const CubeStage0Args& args)
         return result;
     }
 
-    // kg 预取与 H/W 搬运同属 S0，但 kg 只异步发起，不能在这里等待其完成。
-    Stage0PrefetchKgAsync(args);
     for (int i = 0; i < plan.activeHvCount; ++i) {
         const HeadBinding& head = plan.heads[i];
         Stage0LoadH(args, head);
@@ -157,40 +126,46 @@ inline CubeStageResult RunStage0Arch22(const CubeStage0Args& args)
         Stage0ComputeP(args, head);
         ++result.activeTaskCount;
     }
-    result.kgPrefetchCount = plan.stage2Required ? plan.requiredKhCount : 0;
     result.produced = true;
     return result;
 }
 
 // ------------------------------- Stage 2 helpers -------------------------------
 
+inline void Stage2LoadKgForRound(const CubeStage2Args& args)
+{
+    const RoundPlan& plan = *args.plan;
+    // Stage2 自己负责当前 chunk 的全部 distinct kg 搬运；Stage0 不触碰 kg。
+    for (int i = 0; i < plan.requiredKhCount; ++i) {
+        const kg_binding& binding = plan.kg[i];
+        auto& ticket = args.memory->kg[binding.slot];
+
+        // 本 chunk/round 的 slot 只能在上一代最后一个 S2 MTE1 完成后覆写。
+        if (ticket.generation > 0 && !plan.roundBoundaryDrained) {
+            args.sync->Wait(EventKind::kg_overwrite_safe, binding.slot,
+                            /*当前 Stage2 MTE2 生产者*/ 0);
+        }
+        args.memory->acquire_kg(binding.slot);
+
+        // 先把整个 16 KiB entry 置零，再只覆盖 M 个有效 token；尾部不读取 GM padding。
+        Mte2InitConstValueAsync(l1_kg(args.memory->l1, binding.slot), /*zero*/ 0,
+                                /*bytes*/ 16 * 1024);
+        Mte2CopyValidRowsAsync(
+            /*源=*/KeyPayload(*args.in, plan.chunk, binding.kh, binding.payload),
+            /*目的=*/l1_kg(args.memory->l1, binding.slot), plan.chunk.validTokens);
+        // MTE2 先异步发起；Stage2 的首个 mapped head 等待该 slot 完成后再做 MTE1。
+    }
+}
+
 inline void Stage2EnsureKgReady(const CubeStage2Args& args, const kg_binding& binding)
 {
     auto& ticket = args.memory->kg[binding.slot];
-    if (ticket.state == SlotState::Ready) {
+    if (ticket.state != SlotState::Loading) {
+        // 同一 kg slot 的后续 mapped head 直接复用已经 ready 的 entry。
         return;
     }
-
-    if (ticket.state == SlotState::Loading) {
-        // S0 已经发起异步 MTE2；这里只等待该 slot 的本代完成，不重复 GM 读取。
-        wait_mte2_kg_done(binding.slot);
-        args.memory->mark_kg_ready(binding.slot);
-        args.sync->Set(EventKind::kg_ready, binding.slot, /*kg MTE2*/ 0,
-                       /*S2 MTE1*/ 2);
-        return;
-    }
-
-    // S0 被跳过或未预取时，S2 只补齐这个缺失的 distinct (chunk, kh) entry。
-    if (ticket.generation > 0 && !args.plan->roundBoundaryDrained) {
-        args.sync->Wait(EventKind::kg_overwrite_safe, binding.slot,
-                        /*S2 的 MTE2 生产者*/ 0);
-    }
-    args.memory->acquire_kg(binding.slot);
-    Mte2InitConstValue(l1_kg(args.memory->l1, binding.slot), /*zero*/ 0,
-                       /*bytes*/ 16 * 1024);
-    Mte2CopyValidRows(
-        /*源=*/KeyPayload(*args.in, args.plan->chunk, binding.kh, binding.payload),
-        /*目的=*/l1_kg(args.memory->l1, binding.slot), args.plan->chunk.validTokens);
+    // Stage2LoadKgForRound 已经发起本代 MTE2；这里只等待一次，不重复读取 GM。
+    wait_mte2_kg_done(binding.slot);
     args.memory->mark_kg_ready(binding.slot);
     args.sync->Set(EventKind::kg_ready, binding.slot, /*kg MTE2*/ 0,
                    /*S2 MTE1*/ 2);
@@ -245,15 +220,17 @@ inline CubeStageResult RunStage2Arch22(const CubeStage2Args& args)
     CubeStageResult result{};
     const RoundPlan& plan = *args.plan;
     if (!plan.stage2Required) {
-        // v_new-only 最终 chunk 没有 kg/right/D 消费者，S2 整体跳过。
+        // v_new-only 最终 chunk 没有 kg/right/D 消费者，S2 整体跳过，也不搬运 kg。
         return result;
     }
 
+    Stage2LoadKgForRound(args);
     // 每个 active value head 执行一次完整逻辑转置 MMAD；共享 kh 的 head 共享 L1 kg slot。
     for (int i = 0; i < plan.activeHvCount; ++i) {
         Stage2ComputeDForHead(args, plan.heads[i]);
         ++result.activeTaskCount;
     }
+    result.kgLoadCount = plan.requiredKhCount;
     result.produced = true;
     return result;
 }

@@ -66,7 +66,7 @@ inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan)
     const bool noInitialFirst = plan.chunk.first && !ctx.tiling.useInitialState;
 
     if (FwdHStagePolicy::NeedStage0(plan)) {
-        // S0 内部已完成 kg 异步预取、H/W MTE2、MTE1、MMAD、P Fixpipe，并发布 PReady。
+        // S0 只完成 H/W MTE2、MTE1、MMAD、P Fixpipe，并发布 PReady；不搬运 kg。
         RunStage0ByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &plan, &ctx.memory, &ctx.sync});
     }
 
@@ -84,7 +84,8 @@ inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan)
         // final_state 未请求时，最终 chunk 不加载 kg、不执行 S2/S3，也不写无消费者的 L1 右操作数。
         return;
     }
-    // S2 等待 kg_ready/RightReady，完成每个 head 的 MMAD/D Fixpipe，并按最后消费者释放 kg/right。
+    // S2 先按 requiredKh[] 搬运 kg，再等待 kg_ready/RightReady，完成每个 head 的 MMAD/D Fixpipe，
+    // 并按最后消费者释放 kg/right。
     RunStage2ByArch({&ctx.inputs, &ctx.tiling, &plan, &ctx.memory, &ctx.sync});
     // S3 等待 DReady，更新 rolling state；非末 chunk 发布 HReady，末 chunk 按需写 final_state。
     RunStage3ByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &plan, &ctx.memory, &ctx.sync});
@@ -101,7 +102,7 @@ inline void RunFwdH(SchedulerContext& ctx)
             // 这些关系只依赖 HK/HV，与 chunk 无关；后续 chunk 只绑定 token payload。
             const RoundPlan headRoundPlan = BuildHeadRoundPlan(ctx.tiling, round);
             if (round > 0) {
-                // 上一 round 的 kg、H、W 及异步搬运全部排空后，才允许本 round 预取。
+                // 上一 round 的 kg、H、W 及异步搬运全部排空后，才允许本 round 发起搬运。
                 const RoundPlan previousHeadRound = BuildHeadRoundPlan(ctx.tiling, round - 1);
                 const RoundPlan previousRound =
                     BuildChunkPlan(previousHeadRound, ctx.tiling, seq, seq.chunkCount - 1);

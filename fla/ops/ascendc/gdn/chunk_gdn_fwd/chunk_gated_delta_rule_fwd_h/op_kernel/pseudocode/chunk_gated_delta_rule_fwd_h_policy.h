@@ -77,7 +77,7 @@ public:
     void WaitBeforeNextRound(const RoundPlan& previousRound)
     {
         // 这是强制的跨 round 屏障。即使下一 round 再次出现相同 kh，
-        // 也必须在任何 H/W/kg 预取之前调用它。
+        // 也必须在任何 H/W 搬运或 Stage2 kg 搬运之前调用它。
         if (previousRound.stage2Required) {
             for (int i = 0; i < previousRound.requiredKhCount; ++i) {
                 Wait(EventKind::kg_overwrite_safe, previousRound.kg[i].slot, /*下一 round 生产者*/ -1);
