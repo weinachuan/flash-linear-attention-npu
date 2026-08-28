@@ -1,7 +1,8 @@
 // 仅伪代码。FwdH 的阶段策略、L1/UB 槽位和事件协议。
 // 本文件对应真实 op_kernel 中的 chunk_gated_delta_rule_fwd_h_policy.h。
 
-#pragma once
+#ifndef FLA_FWD_H_PSEUDOCODE_CHUNK_GATED_DELTA_RULE_FWD_H_POLICY_H_
+#define FLA_FWD_H_PSEUDOCODE_CHUNK_GATED_DELTA_RULE_FWD_H_POLICY_H_
 
 #include "chunk_gated_delta_rule_fwd_h_tiling_key.h"
 
@@ -537,3 +538,5 @@ struct SchedulerContext {
 };
 
 } // 命名空间 fwd_h_pseudocode
+
+#endif // FLA_FWD_H_PSEUDOCODE_CHUNK_GATED_DELTA_RULE_FWD_H_POLICY_H_

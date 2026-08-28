@@ -1,7 +1,8 @@
 // 仅伪代码。arch35（A5）Cube 阶段：Stage0 和 Stage2。
 // 本文件不包含 arch22 Cube 头文件；A5 的 MTE2/MTE1/MMAD/Fixpipe 路径在此独立描述。
 
-#pragma once
+#ifndef FLA_FWD_H_PSEUDOCODE_ARCH35_CHUNK_GATED_DELTA_RULE_FWD_H_CUBE_H_
+#define FLA_FWD_H_PSEUDOCODE_ARCH35_CHUNK_GATED_DELTA_RULE_FWD_H_CUBE_H_
 
 #include "../chunk_gated_delta_rule_fwd_h_policy.h"
 #include "../chunk_gated_delta_rule_fwd_h_utils.h"
@@ -241,3 +242,5 @@ inline CubeStageResult RunStage2Arch35(const CubeStage2Args& args)
 }
 
 } // namespace fwd_h_pseudocode
+
+#endif // FLA_FWD_H_PSEUDOCODE_ARCH35_CHUNK_GATED_DELTA_RULE_FWD_H_CUBE_H_

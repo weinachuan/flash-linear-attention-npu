@@ -2,7 +2,8 @@
 // A5 不复用 arch22 的 Vec 入口；每个阶段都遵循 MTE2 -> 一个完整 head 的 VF -> MTE3。
 // RegBase API 的写法按昇腾 Reg 矢量计算基础 API 组织，落地时再核对目标 CANN 版本的精确重载。
 
-#pragma once
+#ifndef FLA_FWD_H_PSEUDOCODE_ARCH35_CHUNK_GATED_DELTA_RULE_FWD_H_VEC_H_
+#define FLA_FWD_H_PSEUDOCODE_ARCH35_CHUNK_GATED_DELTA_RULE_FWD_H_VEC_H_
 
 #include "../chunk_gated_delta_rule_fwd_h_policy.h"
 #include "../chunk_gated_delta_rule_fwd_h_utils.h"
@@ -887,3 +888,5 @@ inline VecStageResult RunStage3Arch35(const VecStage3Args& args)
 }
 
 } // 命名空间 fwd_h_pseudocode
+
+#endif // FLA_FWD_H_PSEUDOCODE_ARCH35_CHUNK_GATED_DELTA_RULE_FWD_H_VEC_H_

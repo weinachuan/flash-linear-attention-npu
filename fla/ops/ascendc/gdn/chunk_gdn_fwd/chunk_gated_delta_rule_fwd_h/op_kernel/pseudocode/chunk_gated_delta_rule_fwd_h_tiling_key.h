@@ -1,7 +1,8 @@
 // 仅伪代码。FwdH 的 tiling key、输入输出和 round 数据结构。
 // 本文件对应真实 op_kernel 中的 chunk_gated_delta_rule_fwd_h_tiling_key.h。
 
-#pragma once
+#ifndef FLA_FWD_H_PSEUDOCODE_CHUNK_GATED_DELTA_RULE_FWD_H_TILING_KEY_H_
+#define FLA_FWD_H_PSEUDOCODE_CHUNK_GATED_DELTA_RULE_FWD_H_TILING_KEY_H_
 
 #include <array>
 #include <cstdint>
@@ -195,3 +196,5 @@ struct HostResult {
 };
 
 } // 命名空间 fwd_h_pseudocode
+
+#endif // FLA_FWD_H_PSEUDOCODE_CHUNK_GATED_DELTA_RULE_FWD_H_TILING_KEY_H_

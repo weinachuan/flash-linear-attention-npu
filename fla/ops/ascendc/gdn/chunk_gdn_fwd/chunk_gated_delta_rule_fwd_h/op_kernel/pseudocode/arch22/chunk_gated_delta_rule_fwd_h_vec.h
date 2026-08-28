@@ -1,7 +1,8 @@
 // 仅伪代码。arch22（A2/A3）Vec 阶段：S-1、Stage1 和 Stage3。
 // 该文件保留真实 op_kernel 的文件名和架构目录，具体 Ascend C 调用需在实现时补齐。
 
-#pragma once
+#ifndef FLA_FWD_H_PSEUDOCODE_ARCH22_CHUNK_GATED_DELTA_RULE_FWD_H_VEC_H_
+#define FLA_FWD_H_PSEUDOCODE_ARCH22_CHUNK_GATED_DELTA_RULE_FWD_H_VEC_H_
 
 #include "../chunk_gated_delta_rule_fwd_h_policy.h"
 #include "../chunk_gated_delta_rule_fwd_h_utils.h"
@@ -501,3 +502,5 @@ inline VecStageResult RunStage3Arch22(const VecStage3Args& args)
 }
 
 } // 命名空间 fwd_h_pseudocode
+
+#endif // FLA_FWD_H_PSEUDOCODE_ARCH22_CHUNK_GATED_DELTA_RULE_FWD_H_VEC_H_
