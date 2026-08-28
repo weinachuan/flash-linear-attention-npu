@@ -20,14 +20,16 @@ enum class EventKind {
     WFree,             // S0 MTE1 -> 下一 W owner
     kg_ready,          // kg MTE2 -> S2 首个 MTE1
     kg_overwrite_safe, // 当前 round 最后一个 S2 MTE1 -> 下一 kg MTE2
-    PReady,            // S0 Fixpipe -> S1 VF
+    PReady,            // S0 结果写回并进入 UB -> S1 VF
+    PgmFree,           // arch22 L0C -> GM -> MTE2 完成 -> 下一 arch22 P GM writer
     PFree,             // S1 VF 最后一次读取 P -> 下一 local data owner
     LocalDataFree,     // 首块 H0 MTE3 -> 同一 local data bank 的下一真实 producer
     RightGmReady,      // S1 MTE3(UB ND -> GM ND) -> S2 MTE2
     RightGmFree,       // S2 MTE2(GM ND -> L1 NZ) -> 下一 S1 GM producer
     RightL1Ready,      // S2 MTE2(GM ND -> L1 NZ) -> S2 MTE1
     RightFree,         // S2 MTE1 -> 下一 L1 right/H owner
-    DReady,            // S2 Fixpipe -> S3 VF
+    DReady,            // S2 结果写回并进入 UB -> S3 VF
+    DgmFree,           // arch22 L0C -> GM -> MTE2 完成 -> 下一 arch22 D GM writer
     DFree,             // S3 VF 最后一次读取 D -> 下一 local data owner
     VNewWorkFree,      // S1 V_new 相关 MTE3 -> 下一 S1 MTE2
     StateToVFree,      // state MTE3 -> 下一 Vector consumer
@@ -36,6 +38,36 @@ enum class EventKind {
     StateReady,        // S1/状态 MTE2 -> S3 VF
     StateFree,         // 状态最后消费者 -> 下一状态 owner
     TerminalDrain,     // round/sequence 末尾所有异步搬运
+};
+
+class SyncLedger;
+class FixedMemory;
+
+// Cube 阶段的参数契约与具体架构无关；硬件搬运、MMAD 和 Fixpipe 只能在 arch22/arch35
+// 各自的 Cube 头文件中实现，禁止把架构特性放进这个公共结构。
+struct CubeStage0Args {
+    const ApiInputs* in = nullptr;
+    const ApiOutputs* out = nullptr;
+    const TilingPlan* tiling = nullptr;
+    const RoundPlan* plan = nullptr;
+    WorkspaceRefs* workspace = nullptr;
+    FixedMemory* memory = nullptr;
+    SyncLedger* sync = nullptr;
+};
+
+struct CubeStage2Args {
+    const ApiInputs* in = nullptr;
+    const TilingPlan* tiling = nullptr;
+    const RoundPlan* plan = nullptr;
+    WorkspaceRefs* workspace = nullptr;
+    FixedMemory* memory = nullptr;
+    SyncLedger* sync = nullptr;
+};
+
+struct CubeStageResult {
+    bool produced = false;
+    int activeTaskCount = 0;
+    int kgLoadCount = 0;
 };
 
 struct EventToken {

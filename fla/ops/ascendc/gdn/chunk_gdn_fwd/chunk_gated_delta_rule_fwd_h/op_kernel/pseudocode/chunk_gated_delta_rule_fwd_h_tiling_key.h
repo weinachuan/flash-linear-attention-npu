@@ -65,6 +65,9 @@ struct ApiOutputs {
 };
 
 struct WorkspaceRefs {
+    // 架构扩展 scratch；其含义只在对应 arch Cube 头文件解释，arch35 不访问这两组槽位。
+    std::array<TensorRef, kMaxRoundHeads> cubeScratch0{};
+    std::array<TensorRef, kMaxRoundHeads> cubeScratch1{};
     // 右操作数的私有 GM scratch。Stage1 写入 ND，Stage2 再搬成 L1 NZ；
     // 每个 head_round slot 只保存当前 chunk，GM 搬入 L1 后立即归还。
     TensorRef rightOperandGm;

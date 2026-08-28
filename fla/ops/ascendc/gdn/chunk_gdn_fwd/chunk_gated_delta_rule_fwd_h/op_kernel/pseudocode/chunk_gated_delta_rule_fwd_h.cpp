@@ -72,8 +72,9 @@ inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan)
     const bool noInitialFirst = plan.chunk.first && !ctx.tiling.useInitialState;
 
     if (FwdHStagePolicy::NeedStage0(plan)) {
-        // S0 只完成 H/W MTE2、MTE1、MMAD、P Fixpipe，并发布 PReady；不搬运 kg。
-        RunStage0ByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &plan, &ctx.memory, &ctx.sync});
+        // S0 只完成 H/W MTE2、MTE1、MMAD 和架构对应的 P 写回，并发布 PReady；不搬运 kg。
+        RunStage0ByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &plan, &ctx.workspace,
+                         &ctx.memory, &ctx.sync});
     }
 
     Stage1Variant variant = Stage1Variant::WithP;
@@ -91,7 +92,7 @@ inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan)
         // final_state 未请求时，最终 chunk 不加载 kg、不执行 S2/S3，也不写无消费者的 L1 右操作数。
         return;
     }
-    // S2 先按 requiredKh[] 搬运 kg，再完成每个 head 的 GM ND -> L1 NZ、MMAD/D Fixpipe，
+    // S2 先按 requiredKh[] 搬运 kg，再完成每个 head 的 GM ND -> L1 NZ、MMAD 和架构对应的 D 写回，
     // 并按最后消费者释放 kg/right。
     RunStage2ByArch({&ctx.inputs, &ctx.tiling, &plan, &ctx.workspace, &ctx.memory, &ctx.sync});
     // S3 等待 DReady，更新 rolling state；非末 chunk 写 H GM layout-aware 并发布 HGmReady，

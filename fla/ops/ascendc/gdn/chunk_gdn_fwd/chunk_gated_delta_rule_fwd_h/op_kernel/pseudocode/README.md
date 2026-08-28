@@ -27,9 +27,9 @@ op_kernel/
 | `chunk_gated_delta_rule_fwd_h_tiling_key.h` | 定义固定维度、属性、输入输出、`HeadBinding`、`RoundPlan` 及 owner 数据结构 | API tensor 和属性 | tiling/head-round/chunk 数据结构 | dispatch 前确定 head 映射；每个 chunk 只复制并补充 token/Stage 字段 |
 | `chunk_gated_delta_rule_fwd_h_policy.h` | 定义 Stage 分支、L1/UB 地址、槽位所有权和事件台账 | slot、Stage、producer/consumer | ready/free/terminal 状态 | 槽位复用必须先等待对应 free 或覆盖安全事件 |
 | `chunk_gated_delta_rule_fwd_h_utils.h` | 参数校验、state 布局寻址、GVA 映射、`required_hk_round` 规划 | `ApiInputs`、sequence/chunk id | `HostResult`、`RoundPlan` | 不读取未校验的 GM；不按整段 sequence 预留 kg |
-| `arch22/chunk_gated_delta_rule_fwd_h_cube.h` | arch22 的 Stage0/Stage2 Cube 伪代码 | H/W/k、当前 round 计划 | P、D、kg ready/free | Stage0 只计算 P；Stage2 入口加载 kg，最后一次 MTE1 后释放 kg |
+| `arch22/chunk_gated_delta_rule_fwd_h_cube.h` | arch22 的 Stage0/Stage2 Cube 伪代码 | H/W/k、当前 round 计划 | P、D、kg ready/free | A2/A3 的 P、D 均走 L0C -> GM -> MTE2 -> UB；Stage2 入口加载 kg，最后一次 MTE1 后释放 kg |
 | `arch22/chunk_gated_delta_rule_fwd_h_vec.h` | arch22 的 S-1/Stage1/Stage3 Vec 伪代码 | initial_state、u、P、D、门控 | H0、`V_new`、GM ND right、h、final_state | `V_new`/GM ND right 只保留到各自消费者；无消费者的最终 chunk 不写 right |
-| `arch35/chunk_gated_delta_rule_fwd_h_cube.h` | A5 Cube 入口和架构替换点 | 与 arch22 相同 | 与 arch22 相同 | 当前用 arch22 契约占位，落地时替换 A5 指令/API |
+| `arch35/chunk_gated_delta_rule_fwd_h_cube.h` | A5 独立 Cube Stage0/Stage2 实现 | H/W/k、当前 round 计划 | P、D、kg ready/free | A5 自己完成 MTE2/MTE1/MMAD/Fixpipe；支持 L0C -> UB，P/D 不经过 arch22 或 GM |
 | `arch35/chunk_gated_delta_rule_fwd_h_vec.h` | A5 独立 Vec 实现；每个阶段一个 RegBase 完整 head VF | initial/u/P/D、门控、state | H0、`V_new`、GM ND right、h、final_state | 不包含 arch22 Vec；MTE2 完成后只进入本文件的单次 VF，MTE3 写 GM ND，S2 再转 L1 NZ |
 | `chunk_gated_delta_rule_fwd_h.cpp` | Host 适配、架构选择和 sequence -> round -> chunk 调度 | 框架 tensor、属性 | `(h, v_new, final_state)` | 下一 round 必须等上一 round 的 kg/H/W/异步搬运全部排空 |
 
@@ -58,11 +58,12 @@ S-1 的一次完整 task 顺序固定为：`MTE2(initial GM -> FP32 UB)` -> `MTE
 | --- | --- | --- | --- | --- |
 | `Stage0LoadH` | BF16 initial、S-1 H0 或前一 S3 H 的 GM layout-aware 存储 | canonical `H_c[K,V]` | L1 head slot `[128,256)`，MTE2 转 NZ | BF16 initial 为本地 MTE2；其他来源 `HGmReady -> MTE2 -> HReady` |
 | `Stage0LoadW` | `w[chunk,hv]` 有效 `M` 行 | `w_c[M,K]` | L1 W slot `[0,64)` | `WFree -> WReady`；尾部先清零再覆盖有效行 |
-| `Stage0ComputeP` | L1 W/H | `Pacc` FP32，再转 `P` | L0A/L0B；UB local data bank 的 P 区 | `WReady/HReady -> MTE1 -> MMAD -> Fixpipe(PReady)`；S1 末次读取后 `PFree` |
+| `Stage0ComputeP` | L1 W/H | `Pacc` FP32，再转 `P` | L0A/L0B；UB local data bank 的 P 区 | arch22：`WReady/HReady -> MTE1 -> MMAD -> L0C->GM->MTE2->UB(PReady)`；arch35：`... -> L0C->UB(PReady)`；S1 末次读取后 `PFree` |
 
-S0 的真实顺序是：每个 head 依次完成 H/W MTE2、MTE1、MMAD 和 Fixpipe；S0 不读取或搬运
-`kg`。`P` 按 StateT 选择 `F322BF16` 或 `NoQuant`，不经过 GM。首 chunk 无 initial 时
-整个 S0 跳过，不能用 `W @ 0` 伪造 P。
+S0 的真实顺序是：每个 head 依次完成 H/W MTE2、MTE1、MMAD 和架构对应的结果写回；S0 不读取或搬运
+`kg`。arch22 的 A2/A3 不支持 L0C -> UB，`P` 按 StateT 选择格式写入 P GM scratch，再由 A2 MTE2
+搬回 UB；arch35 的 A5 直接由 Fixpipe 写配对 AIV UB。首 chunk 无 initial 时整个 S0 跳过，不能用
+`W @ 0` 伪造 P。
 
 ### Stage1：Vector 计算 `V_new` 和 Stage2 右操作数
 
@@ -90,14 +91,15 @@ ND 搬成 L1 NZ，不能走 UB -> L1 直通路径，否则一次搬运会被拆�
 | `Stage2PrefetchRightToL1Nz` | 私有 GM ND right scratch | 异步发起 L1 NZ 右操作数搬运 | 对应 H slot `[128,256)`；Stage2 才 acquire | `RightGmReady -> MTE2` |
 | `Stage2EnsureRightL1Ready` | 已发起的 GM ND -> L1 NZ 搬运 | L1 NZ 右操作数就绪 | 对应 H slot `[128,256)` | MTE2 完成后 `RightL1Ready`、`RightGmFree` |
 | `Stage2WaitRightL1AndAcquireD` | L1 NZ 右操作数、P/D local data owner | D owner | UB local data bank `[0,128)` | `RightL1Ready` 和前一 owner `PFree/DFree` |
-| `Stage2ComputeDForHead` | g-only `k_raw + V_new_g` 或 gk-only `kg + V_new` | FP32 `D` | L0A/L0B；Fixpipe 到 UB D 区 `[0,128)` | 首个 mapped head 等 `kg_ready`；`MMAD -> NoQuant Fixpipe -> DReady` |
+| `Stage2ComputeDForHead` | g-only `k_raw + V_new_g` 或 gk-only `kg + V_new` | FP32 `D` | L0A/L0B；arch22 经 GM scratch 回到 UB，arch35 由 Fixpipe 到 UB D 区 `[0,128)` | 首个 mapped head 等 `kg_ready`；arch22：`MMAD -> L0C->GM->MTE2->UB`，arch35：`MMAD -> L0C->UB`，随后 `DReady` |
 | `Stage2ReleaseInputs` | 本次 MTE1 读取完成 | 释放 right/kg | L1 right 与 kg slot | right 最后消费者 `RightFree`；kg 最后消费者 `kg_overwrite_safe` |
 
 Stage2 进入时先为当前 round 的每个 distinct `kh` 发起一次 MTE2；同一个 `kh` 的多个 value
 head 共享一份 L1 kg payload，但每个 head 仍以自己的右操作数执行一次 MMAD。`kg_ready`
 只由第一个 mapped head 等待一次，后续 head 直接复用 valid entry；最后一个 mapped head 的
-MTE1 完成后才释放该 kg slot。S2 的 D 始终 `NoQuant` 写 FP32 UB，不写 GM，不读取本 Stage
-产生的 D。这里的 `Fixpipe -> UB(D)` 保留；需要规避的是 ND UB -> NZ L1 的直通右操作数路径。
+MTE1 完成后才释放该 kg slot。S2 的 D 始终 `NoQuant` 写 FP32 UB，不作为 Stage2 的公开输出；
+arch22 的 D 经过独立 GM scratch，arch35 的 D 使用 A5 的 L0C -> UB。两种架构都需要规避 ND
+UB -> NZ L1 的直通右操作数路径。
 
 ### Stage3：Vector 更新 rolling state
 
@@ -159,13 +161,13 @@ RegBase VF 的编译约束：
 | --- | --- | --- | --- |
 | S0 MTE2 -> S0 MTE1 | W/H | `WReady`、`HReady` | MTE1 完成后分别释放 `WFree`、`HFree` |
 | S0 MTE1 -> S0 Cube/Fixpipe | W/H 到 L0 | MTE1-to-Cube 依赖 | Fixpipe 写 P 前不读取 P |
-| S0 Fixpipe -> S1 VF | P | `PReady` | S1 VF 最后一次读 P 后 `PFree` |
+| S0 结果写回 -> S1 VF | P | arch22：`PgmFree` 后发布 `PReady`；arch35：Fixpipe 后发布 `PReady` | S1 VF 最后一次读 P 后 `PFree` |
 | 首块 H0 MTE3 -> 本 chunk S2 | FP32 无 initial 的 H0 交接 | `LocalDataFree` | S2 获取同一 local data bank 前等待 |
 | S1 MTE2 -> S1 VF | U/g/gk_last | MTE2-to-VF 事件 | VF 完成前不得复用 gate/work bank |
 | S1 MTE3 -> S2 MTE2 | V_new_g/V_new 的 GM ND scratch | `RightGmReady` | S2 MTE2 读完后 `RightGmFree`，允许下一 chunk/round 复用 |
 | S2 MTE2 -> S2 MTE1 | L1 NZ right | `RightL1Ready` | S2 最后一次 MTE1 后 `RightFree` |
 | S2 MTE2 -> S2 首个 MTE1 | kg | `kg_ready`，每 slot 每代一次 | 最后一个 mapped head 后 `kg_overwrite_safe` |
-| S2 Fixpipe -> S3 VF | D | `DReady` | S3 最后一次读 D 后 `DFree` |
+| S2 结果写回 -> S3 VF | D | arch22：`DgmFree` 后发布 `DReady`；arch35：Fixpipe 后发布 `DReady` | S3 最后一次读 D 后 `DFree` |
 | S-1/S3 MTE3 -> S0 MTE2 | H 的 GM layout-aware 存储 | `HGmReady` | S0 MTE2 转成 L1 NZ 后发布 `HReady` |
 | S3 MTE3 -> 后继消费者 | state | `StateToVFree` 或 `StateToMte2Free` | 仅发布有真实消费者的 token |
 
@@ -210,6 +212,7 @@ round r 最后一个 chunk 完成：
 | L1 | `[0,64)` | 4 份 `W_c[M,K]`，每份 16 KiB | 空闲 | 空闲 | 空闲 |
 | L1 | `[128,256)` | 4 份 `H_c[K,V]`，每份 32 KiB | 空闲（不接收 UB ND） | GM ND 经 MTE2 转 NZ 后为同一右操作数 | 非末 chunk 为 `H_{c+1}` |
 | L1 | `[256,320)` | 空闲 | 空闲 | `Nkg_round` 份 `kg/k_raw[M,K]`，每份 16 KiB | 空闲 |
+| Cube 扩展 scratch | `cubeScratch0[0..3]`、`cubeScratch1[0..3]` | arch22：在本架构文件内分别解释为 P/D GM 中转；arch35：空闲 | arch22：P/D 各自中转后立即释放；arch35：空闲 | arch22：对应 GM->UB MTE2 完成后 `PgmFree/DgmFree`；arch35：不使用 |
 | GM scratch | `rightOperandGm[0..3]` | 空闲 | `V_new_g/V_new[M,V]`，ND | MTE2 读出后立即释放 | 空闲 |
 | UB local data | 每个 AIV `[0,64)`、`[64,128)` | `P`，BF16 16 KiB 或 FP32 32 KiB | 保留 `P`；g-only 右操作数使用固定 ND 子区并写 GM | `D`，FP32 64 KiB | `D`；FP32 逐行末读后低 32 KiB 改写 H |
 | UB V_new work | BF16 `[192,224)`；FP32 `[128,160)` | 空闲 | `U -> V_new` 原位 owner 移交 | 已由 MTE3 释放 | 不使用 |
@@ -233,7 +236,8 @@ GM scratch 只保存当前 chunk 的 ND 右操作数，S2 MTE2 完成后通过 `
         对每个 active head：
             S0.LoadH()                         # BF16 initial 本地 MTE2；其余等待 HGmReady 后再转 L1 NZ
             S0.LoadW()                         # 清零 tail 后搬入 M 个有效行
-            S0.MTE1(W,H) -> MMAD -> Fixpipe(P)
+            S0.MTE1(W,H) -> MMAD -> arch22: L0C->GM->MTE2->UB(P)
+                                      arch35: L0C->UB(P)
             发布 PReady；释放 W/H；保留 P 到 S1 末次读取
 
     对每个 active head：
@@ -251,7 +255,8 @@ GM scratch 只保存当前 chunk 的 ND 右操作数，S2 MTE2 完成后通过 `
             确保其 kg slot valid；首个 mapped head 等待本 Stage2 的 MTE2
             确认预取的 GM ND -> L1 NZ 已完成，发布 RightL1Ready/RightGmFree
             等待 RightL1Ready 和 local data free
-            MTE1(kg,right) -> MMAD -> NoQuant Fixpipe(D)
+            MTE1(kg,right) -> MMAD -> arch22: L0C->GM->MTE2->UB(D)
+                                      arch35: L0C->UB(D)
             发布 DReady；最后一个 mapped head 释放 kg_overwrite_safe
 
         对每个 active head：
