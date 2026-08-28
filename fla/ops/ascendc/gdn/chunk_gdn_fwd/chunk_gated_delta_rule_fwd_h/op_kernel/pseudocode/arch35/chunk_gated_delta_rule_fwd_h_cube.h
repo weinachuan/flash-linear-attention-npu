@@ -26,7 +26,6 @@ inline void Stage0LoadHArch35(const CubeStage0Args& args, const HeadBinding& hea
         args.memory->AcquireHForS0(head.hSlot);
         Mte2StateToCanonicalHArch35(*args.in, head.hv, args.tiling->stateLayout,
                                     L1H(args.memory->l1, head.hSlot));
-        wait_mte2_h_l1_done_arch35(head.hSlot);
         args.memory->MarkHReady(head.hSlot);
         args.sync->Set(EventKind::HReady, head.hSlot, /*A5 S0 MTE2*/ 0,
                        /*A5 S0 MTE1*/ 1);
@@ -35,10 +34,12 @@ inline void Stage0LoadHArch35(const CubeStage0Args& args, const HeadBinding& hea
 
     // FP32 initial 来自 S-1，后续 chunk 来自前一个 S3；GM layout-aware H 再转为 L1 NZ。
     args.sync->Wait(EventKind::HGmReady, head.hSlot, /*A5 S0 MTE2*/ 0);
+    if (plan.chunk.chunk > 0) {
+        args.sync->Wait(EventKind::RightFree, head.hSlot, /*A5 S0 MTE2*/ 0);
+    }
     Mte2CopyHFromGmLayoutAwareToL1NzAsyncArch35(
         *args.out, *args.tiling, *args.plan, head,
         L1H(args.memory->l1, head.hSlot));
-    wait_mte2_h_l1_done_arch35(head.hSlot);
     args.sync->Set(EventKind::HReady, head.hSlot, /*A5 S0 MTE2*/ 0,
                    /*A5 S0 MTE1*/ 1);
     args.memory->BeginHReadFromS3(head.hSlot);
@@ -61,15 +62,28 @@ inline void Stage0LoadWArch35(const CubeStage0Args& args, const HeadBinding& hea
                    /*A5 S0 MTE1*/ 1);
 }
 
-inline void Stage0ComputePArch35(const CubeStage0Args& args, const HeadBinding& head)
+inline void Stage0ComputePArch35(const CubeStage0Args& args, const HeadBinding& head,
+                                 int pipelineSlot)
 {
     // Stage0 计算公式：P_c,h = W_c,h @ H_c,h，BF16 x BF16 -> FP32 L0C。
     // A5 支持 L0C -> UB，P 不经过 GM；Fixpipe 按 StateT 选择量化格式。
+    if (args.plan->chunk.chunk > 0) {
+        // AIC 四槽在本 round 内互不复用；这里只接收上一 chunk Stage2 对同一物理槽的 free。
+        // 跨 round 已由动态 CubeRoundDrain 收口，不能等待上一 round 未必生成的槽级 token。
+        args.sync->Wait(EventKind::S2CubeToMte1Free, pipelineSlot,
+                        /*A5 S0 MTE1*/ 1);
+    }
+    args.sync->Wait(EventKind::S0Mte2ToMte1Ready, pipelineSlot, /*A5 S0 MTE1*/ 1);
     args.sync->Wait(EventKind::WReady, head.wSlot, /*A5 S0 MTE1*/ 1);
     args.sync->Wait(EventKind::HReady, head.hSlot, /*A5 S0 MTE1*/ 1);
     Mte1LoadArch35(L1W(args.memory->l1, head.wSlot), L0AArch35(head));
     Mte1LoadArch35(L1H(args.memory->l1, head.hSlot), L0BArch35(head));
-    Mte1ToCubeReadyArch35(/*W/H 已全部进入 L0*/ head);
+    args.sync->Set(EventKind::S0Mte1ToCubeReady, pipelineSlot,
+                   /*A5 S0 MTE1*/ 1, /*A5 S0 Cube*/ 2);
+    args.sync->Wait(EventKind::S0Mte1ToCubeReady, pipelineSlot, /*A5 S0 Cube*/ 2);
+    if (args.plan->chunk.chunk > 0) {
+        args.sync->Wait(EventKind::S2FixpipeToCubeFree, pipelineSlot, /*A5 S0 Cube*/ 2);
+    }
 
     const auto& localData = args.memory->localData[FixedMemory::LocalBank(head)];
     if (localData.generation > 0 && !args.plan->roundBoundaryDrained) {
@@ -84,6 +98,13 @@ inline void Stage0ComputePArch35(const CubeStage0Args& args, const HeadBinding& 
     args.memory->AcquireLocalDataForP(head);
     const auto pAcc = MmadBf16AccFp32Arch35(L0AArch35(head), L0BArch35(head),
                                                 args.plan->chunk.validTokens);
+    if (args.plan->stage2Required) {
+        args.sync->Set(EventKind::S0CubeToMte1Free, pipelineSlot,
+                       /*A5 S0 Cube*/ 2, /*当前 A5 S2 MTE1*/ 2);
+    }
+    args.sync->Set(EventKind::S0CubeToFixpipeReady, pipelineSlot,
+                   /*A5 S0 Cube*/ 2, /*A5 S0 Fixpipe*/ 3);
+    args.sync->Wait(EventKind::S0CubeToFixpipeReady, pipelineSlot, /*A5 S0 Fixpipe*/ 3);
     FixpipePByStateTypeArch35(pAcc, UbP(*args.memory, head), args.tiling->stateType);
     args.memory->MarkPReady(head);
     args.sync->Set(EventKind::PReady, head.roundHead, /*A5 S0 Fixpipe*/ 0,
@@ -93,6 +114,10 @@ inline void Stage0ComputePArch35(const CubeStage0Args& args, const HeadBinding& 
     args.memory->ReleaseHAfterS0Mte1(head.hSlot);
     args.sync->Release(EventKind::WFree, head.wSlot, /*A5 S0 MTE1*/ 1);
     args.sync->Release(EventKind::HFree, head.hSlot, /*A5 S0 MTE1*/ 1);
+    if (args.plan->stage2Required) {
+        args.sync->Set(EventKind::S0FixpipeToCubeFree, pipelineSlot,
+                       /*A5 S0 Fixpipe*/ 3, /*当前 A5 S2 Cube*/ 0);
+    }
 }
 
 inline CubeStageResult RunStage0Arch35(const CubeStage0Args& args)
@@ -104,12 +129,25 @@ inline CubeStageResult RunStage0Arch35(const CubeStage0Args& args)
         // 首 chunk 无 initial 时，S0 不执行 W @ 0，也不发布 PReady。
         return result;
     }
-    for (int i = 0; i < plan.activeHvCount; ++i) {
-        const HeadBinding& head = plan.heads[i];
+    for (int coreHeadId = 0; coreHeadId < plan.activeHvCount; ++coreHeadId) {
+        const CoreHeadBinding current = BindAicCoreHead(plan, coreHeadId);
+        const HeadBinding& head = plan.heads[current.roundHead];
         Stage0LoadHArch35(args, head);
         Stage0LoadWArch35(args, head);
-        Stage0ComputePArch35(args, head);
+        // 当前 head 的 H/W MTE2 批次后立刻发布本 slot ready，再下发下一 head 的 MTE2。
+        args.sync->Set(EventKind::S0Mte2ToMte1Ready, current.pipelineSlot,
+                       /*A5 S0 MTE2*/ 0, /*A5 S0 MTE1*/ 1);
+        if (coreHeadId > 0) {
+            const CoreHeadBinding previous = BindAicCoreHead(plan, coreHeadId - 1);
+            Stage0ComputePArch35(args, plan.heads[previous.roundHead],
+                                 previous.pipelineSlot);
+        }
         ++result.activeTaskCount;
+    }
+    if (plan.activeHvCount > 0) {
+        const int lastCoreHeadId = plan.activeHvCount - 1;
+        const CoreHeadBinding last = BindAicCoreHead(plan, lastCoreHeadId);
+        Stage0ComputePArch35(args, plan.heads[last.roundHead], last.pipelineSlot);
     }
     result.produced = true;
     return result;
@@ -134,50 +172,56 @@ inline void Stage2LoadKgForRoundArch35(const CubeStage2Args& args)
         Mte2CopyValidRowsAsyncArch35(
             /*源=*/KeyPayload(*args.in, plan.chunk, binding.kh, binding.payload),
             /*目的=*/l1_kg(args.memory->l1, binding.slot), plan.chunk.validTokens);
-        // A5 MTE2 只在此处发起一次；首个 mapped head 等待 ready 后再做 MTE1。
+        // 当前 kg slot 的 MTE2 后立即发布 ready；不得等所有 kg 搬完后统一 Set。
+        args.memory->mark_kg_ready(binding.slot);
+        args.sync->Set(EventKind::kg_ready, binding.slot, /*A5 kg MTE2*/ 0,
+                       /*A5 S2 MTE1*/ 2);
     }
 }
 
 inline void Stage2EnsureKgReadyArch35(const CubeStage2Args& args, const kg_binding& binding)
 {
     // kg_c,kh 完整进入 A5 L1 后，才允许映射到该 slot 的 head 做 MTE1。
-    auto& ticket = args.memory->kg[binding.slot];
-    if (ticket.state != SlotState::Loading) {
-        return;
-    }
-    wait_mte2_kg_done_arch35(binding.slot);
-    args.memory->mark_kg_ready(binding.slot);
-    args.sync->Set(EventKind::kg_ready, binding.slot, /*A5 kg MTE2*/ 0,
-                   /*A5 S2 MTE1*/ 2);
+    // ready 已由 Stage2LoadKgForRoundArch35 紧跟本 slot MTE2 发布；这里不做全局 MTE2 wait。
+    (void)args;
+    (void)binding;
 }
 
 inline void Stage2PrefetchRightToL1NzArch35(const CubeStage2Args& args,
-                                            const HeadBinding& head)
+                                            const HeadBinding& head,
+                                            int pipelineSlot)
 {
     // Stage2 右操作数公式：g-only 搬 V_new_g，gk-only 搬 V_new；GM ND 转为 L1 NZ。
     const int rightGmSlot = head.roundHead;
     args.sync->Wait(EventKind::RightGmReady, rightGmSlot, /*A5 S2 MTE2*/ 0);
+    if (args.plan->stage0Required) {
+        args.sync->Wait(EventKind::HFree, head.hSlot, /*A5 S2 MTE2*/ 0);
+    }
     args.memory->AcquireRightForS2Mte2(head.hSlot);
     Mte2CopyRightOperandGmNdToL1NzAsyncArch35(
         args.workspace->rightOperandGm, rightGmSlot, args.plan->chunk,
         L1Right(args.memory->l1, head.hSlot), args.plan->chunk.validTokens);
+    args.memory->MarkRightL1Ready(head.hSlot);
+    args.sync->Set(EventKind::RightL1Ready, head.hSlot, /*A5 S2 MTE2*/ 0,
+                   /*A5 S2 MTE1*/ 2);
+    args.sync->Set(EventKind::S2Mte2ToMte1Ready, pipelineSlot,
+                   /*A5 S2 MTE2*/ 0, /*A5 S2 MTE1*/ 2);
+    args.memory->ReleaseRightGmAfterS2Mte2(rightGmSlot);
+    args.sync->Set(EventKind::RightGmFree, rightGmSlot, /*A5 S2 MTE2*/ 0,
+                   /*下一 S1 MTE3*/ 1);
 }
 
 inline void Stage2EnsureRightL1ReadyArch35(const CubeStage2Args& args,
                                             const HeadBinding& head)
 {
     // L1Right_c,h[NZ] 只有在 A5 MTE2 完成后才能被 MTE1 读取。
-    const int rightGmSlot = head.roundHead;
-    wait_mte2_right_l1_done_arch35(head.hSlot);
-    args.memory->MarkRightL1Ready(head.hSlot);
-    args.memory->ReleaseRightGmAfterS2Mte2(rightGmSlot);
-    args.sync->Set(EventKind::RightGmFree, rightGmSlot, /*A5 S2 MTE2*/ 0,
-                   /*下一 S1 MTE3*/ 1);
-    args.sync->Set(EventKind::RightL1Ready, head.hSlot, /*A5 S2 MTE2*/ 0,
-                   /*A5 S2 MTE1*/ 2);
+    // ready/free 已由 producer 紧跟当前 head 的 MTE2 发布。
+    (void)args;
+    (void)head;
 }
 
-inline void Stage2ComputeDForHeadArch35(const CubeStage2Args& args, const HeadBinding& head)
+inline void Stage2ComputeDForHeadArch35(const CubeStage2Args& args, const HeadBinding& head,
+                                        int pipelineSlot)
 {
     // Stage2 计算公式：g-only 为 D_c,h = k_raw_c,kh^T @ V_new_g,c,h；gk-only 为 D_c,h = kg_c,kh^T @ V_new_c,h。
     const kg_binding& binding = args.plan->kg[head.kgSlot];
@@ -185,7 +229,13 @@ inline void Stage2ComputeDForHeadArch35(const CubeStage2Args& args, const HeadBi
     if (head.roundHead == binding.firstConsumerRoundHead) {
         args.sync->Wait(EventKind::kg_ready, binding.slot, /*A5 S2 MTE1*/ 2);
     }
+    if (args.plan->stage0Required) {
+        // AIC 四槽在本 round 内互不复用；这里只接收当前 chunk Stage0 对同一物理槽的 free。
+        args.sync->Wait(EventKind::S0CubeToMte1Free, pipelineSlot,
+                        /*A5 S2 MTE1*/ 2);
+    }
     Stage2EnsureRightL1ReadyArch35(args, head);
+    args.sync->Wait(EventKind::S2Mte2ToMte1Ready, pipelineSlot, /*A5 S2 MTE1*/ 2);
     args.sync->Wait(EventKind::RightL1Ready, head.hSlot, /*A5 S2 MTE1*/ 2);
 
     const auto& localData = args.memory->localData[FixedMemory::LocalBank(head)];
@@ -201,9 +251,21 @@ inline void Stage2ComputeDForHeadArch35(const CubeStage2Args& args, const HeadBi
     args.memory->AcquireLocalDataForD(head);
     Mte1LoadArch35(l1_kg(args.memory->l1, binding.slot), L0AArch35(head));
     Mte1LoadArch35(L1Right(args.memory->l1, head.hSlot), L0BArch35(head));
-    Mte1ToCubeReadyArch35(/*kg/right 已全部进入 L0*/ head);
+    args.sync->Set(EventKind::S2Mte1ToCubeReady, pipelineSlot,
+                   /*A5 S2 MTE1*/ 2, /*A5 S2 Cube*/ 0);
+    args.sync->Wait(EventKind::S2Mte1ToCubeReady, pipelineSlot, /*A5 S2 Cube*/ 0);
+    if (args.plan->stage0Required) {
+        args.sync->Wait(EventKind::S0FixpipeToCubeFree, pipelineSlot, /*A5 S2 Cube*/ 0);
+    }
     const auto dAcc = MmadBf16AccFp32Arch35(L0AArch35(head), L0BArch35(head),
                                                 args.plan->chunk.validTokens);
+    if (args.plan->hasNextChunk) {
+        args.sync->Set(EventKind::S2CubeToMte1Free, pipelineSlot,
+                       /*A5 S2 Cube*/ 0, /*下一 chunk A5 S0 MTE1*/ 1);
+    }
+    args.sync->Set(EventKind::S2CubeToFixpipeReady, pipelineSlot,
+                   /*A5 S2 Cube*/ 0, /*A5 S2 Fixpipe*/ 3);
+    args.sync->Wait(EventKind::S2CubeToFixpipeReady, pipelineSlot, /*A5 S2 Fixpipe*/ 3);
     // A5 支持 L0C -> UB，D 保持 FP32 NoQuant，不经过 GM。
     FixpipeDNoQuantArch35(dAcc, UbD(*args.memory, head));
     args.memory->MarkDReady(head);
@@ -217,6 +279,10 @@ inline void Stage2ComputeDForHeadArch35(const CubeStage2Args& args, const HeadBi
         args.sync->Release(EventKind::kg_overwrite_safe, binding.slot,
                            /*A5 S2 MTE1*/ 2);
     }
+    if (args.plan->hasNextChunk) {
+        args.sync->Set(EventKind::S2FixpipeToCubeFree, pipelineSlot,
+                       /*A5 S2 Fixpipe*/ 3, /*下一 chunk A5 S0 Cube*/ 2);
+    }
 }
 
 inline CubeStageResult RunStage2Arch35(const CubeStage2Args& args)
@@ -229,12 +295,21 @@ inline CubeStageResult RunStage2Arch35(const CubeStage2Args& args)
         return result;
     }
     Stage2LoadKgForRoundArch35(args);
-    for (int i = 0; i < plan.activeHvCount; ++i) {
-        Stage2PrefetchRightToL1NzArch35(args, plan.heads[i]);
-    }
-    for (int i = 0; i < plan.activeHvCount; ++i) {
-        Stage2ComputeDForHeadArch35(args, plan.heads[i]);
+    for (int coreHeadId = 0; coreHeadId < plan.activeHvCount; ++coreHeadId) {
+        const CoreHeadBinding current = BindAicCoreHead(plan, coreHeadId);
+        Stage2PrefetchRightToL1NzArch35(args, plan.heads[current.roundHead],
+                                        current.pipelineSlot);
+        if (coreHeadId > 0) {
+            const CoreHeadBinding previous = BindAicCoreHead(plan, coreHeadId - 1);
+            Stage2ComputeDForHeadArch35(args, plan.heads[previous.roundHead],
+                                        previous.pipelineSlot);
+        }
         ++result.activeTaskCount;
+    }
+    if (plan.activeHvCount > 0) {
+        const int lastCoreHeadId = plan.activeHvCount - 1;
+        const CoreHeadBinding last = BindAicCoreHead(plan, lastCoreHeadId);
+        Stage2ComputeDForHeadArch35(args, plan.heads[last.roundHead], last.pipelineSlot);
     }
     result.kgLoadCount = plan.requiredKhCount;
     result.produced = true;

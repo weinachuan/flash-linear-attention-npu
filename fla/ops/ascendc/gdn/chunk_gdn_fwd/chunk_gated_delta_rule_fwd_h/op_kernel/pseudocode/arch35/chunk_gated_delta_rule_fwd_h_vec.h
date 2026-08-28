@@ -19,6 +19,7 @@ struct VecStageArgs {
     FixedMemory* memory = nullptr;
     SyncLedger* sync = nullptr;
     Stage1Variant variant = Stage1Variant::WithP;
+    int aivId = 0;
 };
 
 struct VecStage3Args {
@@ -28,6 +29,7 @@ struct VecStage3Args {
     const RoundPlan* plan = nullptr;
     FixedMemory* memory = nullptr;
     SyncLedger* sync = nullptr;
+    int aivId = 0;
 };
 
 struct SMinusOneArgs {
@@ -40,6 +42,7 @@ struct SMinusOneArgs {
     int activeHvBegin = 0;
     int activeHvCount = 0;
     bool roundBoundaryDrained = false;
+    int aivId = 0;
 };
 
 struct VecStageResult {
@@ -481,24 +484,21 @@ inline void DispatchStage3Vf(const Stage3VfCall& call, StateType stateType, Gate
 inline void A5SMinusOneLoadInitial(const SMinusOneArgs& args, const HeadBinding& head)
 {
     // S-1 输入公式：R_0,h = layout_decode(initial_state[n,h,:,:])，MTE2 将其搬入 UB FP32 canonical [K,V]。
-    const int bank = FixedMemory::LocalBank(head);
-    auto& input = args.memory->initialInput[bank];
-    if (input.generation > 0 && !args.roundBoundaryDrained) {
-        args.sync->Wait(EventKind::InitialInputFree, bank, /*S-1 MTE2*/ 0);
-    }
+    const int eventSlot = head.localSlot;
     args.memory->AcquireInitialInput(head);
     Mte2StateToFp32UbAsync(InitialStateAt(*args.in, args.sequence->sequence, head.hv),
                            UbInitialInput(*args.memory, head), args.tiling->stateLayout);
     args.memory->MarkInitialInputReady(head);
-    args.sync->Set(EventKind::InitialInputReady, bank, /*S-1 MTE2*/ 0, /*S-1 VF*/ 1);
+    args.sync->Set(EventKind::InitialInputReady, eventSlot,
+                   /*S-1 MTE2*/ 0, /*S-1 VF*/ 1);
 }
 
 inline void A5SMinusOneConvertAndWriteH0(const SMinusOneArgs& args,
                                          const HeadBinding& head)
 {
     // S-1 计算公式：H_0,h = cast_BF16(R_0,h)，RegBase VF 完成转换后由 MTE3 按 state_v_first 写 GM。
-    const int bank = FixedMemory::LocalBank(head);
-    args.sync->Wait(EventKind::InitialInputReady, bank, /*S-1 VF*/ 1);
+    const int eventSlot = head.localSlot;
+    args.sync->Wait(EventKind::InitialInputReady, eventSlot, /*S-1 VF*/ 1);
     args.memory->AcquireInitialHOutput(head);
     args.memory->ProduceInitialH(head.hSlot);
     // A5 S-1 的 vector 计算只有这一处 VF 调用。
@@ -511,10 +511,12 @@ inline void A5SMinusOneConvertAndWriteH0(const SMinusOneArgs& args,
         elementCount, repeatTimes);
     PipeBarrierVForA5RegBase();
     args.memory->ReleaseInitialInput(head);
-    args.sync->Release(EventKind::InitialInputFree, bank, /*S-1 VF*/ 1);
+    const int pipelineSlot = AivPipelineSlot(head.localSlot);
+    args.sync->Set(EventKind::SMinusVToMte3Ready, pipelineSlot,
+                   /*A5 S-1 VF*/ 1, /*A5 S-1 MTE3*/ 3);
+    args.sync->Wait(EventKind::SMinusVToMte3Ready, pipelineSlot, /*A5 S-1 MTE3*/ 3);
     Mte3WriteH0LayoutAwareAsync(*args.out, *args.tiling, *args.sequence, head.hv,
                                 UbInitialHOutput(*args.memory, head));
-    wait_mte3_h0_done(bank);
     args.memory->MarkHReady(head.hSlot);
     args.memory->MarkInitialHOutputReady(head);
 }
@@ -525,26 +527,51 @@ inline void RunSMinusOneArch35(const SMinusOneArgs& args)
     if (!args.tiling->useInitialState || args.tiling->stateType != StateType::Fp32) {
         return;
     }
-    for (int local = 0; local < args.activeHvCount; ++local) {
+    const int coreHeadCount =
+        args.activeHvCount > args.aivId
+            ? (args.activeHvCount - args.aivId + kAivCount - 1) / kAivCount
+            : 0;
+    for (int coreHeadId = 0; coreHeadId < coreHeadCount; ++coreHeadId) {
+        const int roundHead = args.aivId + coreHeadId * kAivCount;
         HeadBinding head{};
-        head.roundHead = local;
-        head.hv = args.activeHvBegin + local;
-        head.hSlot = local;
-        head.aiv = local % kAivCount;
-        head.localSlot = local / kAivCount;
+        head.roundHead = roundHead;
+        head.hv = args.activeHvBegin + roundHead;
+        head.hSlot = roundHead;
+        head.aiv = args.aivId;
+        head.localSlot = coreHeadId;
         A5SMinusOneLoadInitial(args, head);
-        A5SMinusOneConvertAndWriteH0(args, head);
+        if (coreHeadId > 0) {
+            const int previousRoundHead = args.aivId + (coreHeadId - 1) * kAivCount;
+            HeadBinding previous{};
+            previous.roundHead = previousRoundHead;
+            previous.hv = args.activeHvBegin + previousRoundHead;
+            previous.hSlot = previousRoundHead;
+            previous.aiv = args.aivId;
+            previous.localSlot = coreHeadId - 1;
+            A5SMinusOneConvertAndWriteH0(args, previous);
+        }
     }
-    args.sync->Set(EventKind::InitialPhaseDrain, args.sequence->sequence,
-                   /*S-1 MTE3*/ 1, /*调度器*/ -1);
-    for (int local = 0; local < args.activeHvCount; ++local) {
-        args.sync->Set(EventKind::HGmReady, local, /*S-1 phase*/ 1, /*S0 MTE2*/ 0);
+    if (coreHeadCount > 0) {
+        const int coreHeadId = coreHeadCount - 1;
+        const int roundHead = args.aivId + coreHeadId * kAivCount;
+        HeadBinding last{};
+        last.roundHead = roundHead;
+        last.hv = args.activeHvBegin + roundHead;
+        last.hSlot = roundHead;
+        last.aiv = args.aivId;
+        last.localSlot = coreHeadId;
+        A5SMinusOneConvertAndWriteH0(args, last);
+    }
+    // 逐 head 发布 HGmReady；跨 round 的统一排空由 VectorRoundDrain 负责。
+    for (int coreHeadId = 0; coreHeadId < coreHeadCount; ++coreHeadId) {
+        const int roundHead = args.aivId + coreHeadId * kAivCount;
+        args.sync->Set(EventKind::HGmReady, roundHead, /*S-1 phase*/ 1, /*S0 MTE2*/ 0);
         HeadBinding head{};
-        head.roundHead = local;
-        head.hv = args.activeHvBegin + local;
-        head.hSlot = local;
-        head.aiv = local % kAivCount;
-        head.localSlot = local / kAivCount;
+        head.roundHead = roundHead;
+        head.hv = args.activeHvBegin + roundHead;
+        head.hSlot = roundHead;
+        head.aiv = args.aivId;
+        head.localSlot = coreHeadId;
         args.memory->ReleaseInitialHOutput(head);
     }
 }
@@ -568,7 +595,7 @@ inline void A5Stage1PrepareInitialOrZeroState(const VecStageArgs& args,
             Mte2InitConstValueAsync(UbH0Scratch(*args.memory, head), /*zero*/ 0,
                                     /*bytes*/ 32 * 1024);
         }
-        args.sync->Set(EventKind::StateReady, FixedMemory::LocalBank(head),
+        args.sync->Set(EventKind::StateInitToStage1VReady, head.localSlot,
                        /*S1 MTE2*/ 0, /*S1 VF*/ 1);
         return;
     }
@@ -580,17 +607,18 @@ inline void A5Stage1PrepareInitialOrZeroState(const VecStageArgs& args,
         Mte2InitConstValueAsync(UbBf16State(*args.memory, head), /*zero*/ 0,
                                 /*bytes*/ 32 * 1024);
     }
-    args.sync->Set(EventKind::StateReady, FixedMemory::LocalBank(head),
+    args.sync->Set(EventKind::StateInitToStage1VReady, head.localSlot,
                    /*S1 MTE2*/ 0, /*S1 VF*/ 1);
 }
 
-inline void A5Stage1LoadUAndGate(const VecStageArgs& args, const HeadBinding& head)
+inline void A5Stage1LoadUAndGate(const VecStageArgs& args, const HeadBinding& head,
+                                 int pipelineSlot)
 {
     // Stage1 输入公式：U_c,h = U[h,0:M,:]；g-only 另取 g_c,h = g[h,0:M]，无效尾行在 UB 中补零。
     const int bank = FixedMemory::LocalBank(head);
     auto& ticket = args.memory->vNewWork[bank];
     if (ticket.generation > 0 && !args.plan->roundBoundaryDrained) {
-        args.sync->Wait(EventKind::VNewWorkFree, bank, /*S1 MTE2*/ 0);
+        args.sync->Wait(EventKind::S1Mte3ToMte2Free, pipelineSlot, /*A5 S1 MTE2*/ 0);
     }
     args.memory->AcquireVNewWorkForS1(head);
     Mte2InitConstValueAsync(UbVNewWork(*args.memory, head, args.tiling->stateType),
@@ -604,14 +632,17 @@ inline void A5Stage1LoadUAndGate(const VecStageArgs& args, const HeadBinding& he
                                    UbGate(*args.memory, head),
                                    args.plan->chunk.validTokens);
     }
-    WaitMte2ToVForStage1(head);
+    args.sync->Set(EventKind::S1Mte2ToVReady, pipelineSlot,
+                   /*A5 S1 MTE2*/ 0, /*A5 S1 VF*/ 1);
     args.memory->MarkVNewWorkReady(head);
 }
 
-inline void A5Stage1ComputeAndWrite(const VecStageArgs& args, const HeadBinding& head)
+inline void A5Stage1ComputeAndWrite(const VecStageArgs& args, const HeadBinding& head,
+                                    int pipelineSlot)
 {
     // Stage1 计算公式：V_new_fp32,c,h = fp32(U_c,h) - fp32(P_c,h)，再按分支生成 V_new、V_new_g、alpha 和 H_0。
     const RoundPlan& plan = *args.plan;
+    args.sync->Wait(EventKind::S1Mte2ToVReady, pipelineSlot, /*A5 S1 VF*/ 1);
     const bool hasP = plan.stage0Required;
     if (hasP) {
         args.sync->Wait(EventKind::PReady, head.roundHead, /*S1 VF*/ 1);
@@ -628,7 +659,7 @@ inline void A5Stage1ComputeAndWrite(const VecStageArgs& args, const HeadBinding&
         args.memory->AcquireLocalDataForH0(head);
     }
     if (writeBf16H0) {
-        args.sync->Wait(EventKind::StateReady, FixedMemory::LocalBank(head),
+        args.sync->Wait(EventKind::StateInitToStage1VReady, head.localSlot,
                         /*S1 VF*/ 1);
     }
     const auto* stateBf16 = args.tiling->stateType == StateType::Bf16
@@ -661,6 +692,10 @@ inline void A5Stage1ComputeAndWrite(const VecStageArgs& args, const HeadBinding&
                                  writeRight, writeH0, zeroH0);
     PipeBarrierVForA5RegBase();
 
+    args.sync->Set(EventKind::S1VToMte3Ready, pipelineSlot,
+                   /*A5 S1 VF*/ 1, /*A5 S1 MTE3*/ 3);
+    args.sync->Wait(EventKind::S1VToMte3Ready, pipelineSlot, /*A5 S1 MTE3*/ 3);
+
     write_v_new_from_ub(*args.out, plan.chunk, head.hv,
                         UbVNewBf16(*args.memory, head, args.tiling->stateType));
     if (writeRight) {
@@ -673,7 +708,6 @@ inline void A5Stage1ComputeAndWrite(const VecStageArgs& args, const HeadBinding&
         Mte3WriteRightOperandGmNdAsync(
             args.workspace->rightOperandGm, rightSlot, plan.chunk,
             UbRightBf16(*args.memory, head), plan.chunk.validTokens);
-        wait_mte3_right_gm_done(rightSlot);
         args.memory->MarkRightGmReady(rightSlot);
         args.sync->Set(EventKind::RightGmReady, rightSlot, /*S1 MTE3*/ 1, /*S2 MTE2*/ 0);
     }
@@ -688,7 +722,11 @@ inline void A5Stage1ComputeAndWrite(const VecStageArgs& args, const HeadBinding&
                                         : (plan.finalVNewOnly
                                                ? UbH0Scratch(*args.memory, head)
                                                : UbBf16State(*args.memory, head)));
-        wait_mte3_h0_done(FixedMemory::LocalBank(head));
+        if (writeBf16H0 && plan.stage3Required) {
+            args.memory->MarkBf16StateMte3InFlight(head);
+            args.sync->Set(EventKind::StateToVFree, head.localSlot,
+                           /*S1 H0 MTE3*/ 3, /*本 chunk S3 VF*/ 3);
+        }
         if (writeFp32ZeroH0) {
             args.memory->ReleaseH0AfterMte3(head);
             if (plan.stage2Required) {
@@ -704,15 +742,22 @@ inline void A5Stage1ComputeAndWrite(const VecStageArgs& args, const HeadBinding&
     }
 }
 
-inline void A5Stage1ReleaseWork(const VecStageArgs& args, const HeadBinding& head)
+inline void A5Stage1ReleaseWork(const VecStageArgs& args, const HeadBinding& head,
+                                int pipelineSlot, bool hasNextSameSlot)
 {
     // Stage1 释放公式：V_new 写公开 GM、右操作数写 GM ND scratch 后，释放本 head 的 UB work bank。
-    const int bank = FixedMemory::LocalBank(head);
-    wait_mte3_vnew_done(args.plan->chunk, head.hv);
     args.memory->ReleaseVNewWorkAfterMte3(head);
-    if (args.plan->hasNextChunk || args.plan->hasNextHeadRound) {
-        args.sync->Set(EventKind::VNewWorkFree, bank, /*S1 MTE3*/ 1, /*下一 producer*/ -1);
+    if (hasNextSameSlot || args.plan->hasNextChunk) {
+        args.sync->Set(EventKind::S1Mte3ToMte2Free, pipelineSlot,
+                       /*A5 S1 MTE3*/ 3, /*下一 A5 S1 MTE2*/ 0);
     }
+}
+
+inline void A5Stage1ConsumeHead(const VecStageArgs& args, const HeadBinding& head,
+                                int pipelineSlot, bool hasNextSameSlot)
+{
+    A5Stage1ComputeAndWrite(args, head, pipelineSlot);
+    A5Stage1ReleaseWork(args, head, pipelineSlot, hasNextSameSlot);
 }
 
 inline VecStageResult RunStage1Arch35(const VecStageArgs& args)
@@ -720,16 +765,29 @@ inline VecStageResult RunStage1Arch35(const VecStageArgs& args)
     // Stage1 阶段公式：逐 head 完成 V_new_c,h = cast_BF16(fp32(U_c,h)-fp32(P_c,h)) 及可选右操作数派生；无 P 时取零。
     VecStageResult result{};
     const RoundPlan& plan = *args.plan;
-    for (int i = 0; i < plan.activeHvCount; ++i) {
-        const HeadBinding& head = plan.heads[i];
+    const int coreHeadCount = AivCoreHeadCount(plan, args.aivId);
+    for (int coreHeadId = 0; coreHeadId < coreHeadCount; ++coreHeadId) {
+        const CoreHeadBinding current = BindAivCoreHead(plan, args.aivId, coreHeadId);
+        const HeadBinding& head = plan.heads[current.roundHead];
         A5Stage1PrepareInitialOrZeroState(args, head);
-        A5Stage1LoadUAndGate(args, head);
-        A5Stage1ComputeAndWrite(args, head);
-        A5Stage1ReleaseWork(args, head);
+        A5Stage1LoadUAndGate(args, head, current.pipelineSlot);
+        if (coreHeadId > 0) {
+            const CoreHeadBinding previous =
+                BindAivCoreHead(plan, args.aivId, coreHeadId - 1);
+            A5Stage1ConsumeHead(args, plan.heads[previous.roundHead], previous.pipelineSlot,
+                                /*hasNextSameSlot*/
+                                previous.coreHeadId + kAivPipelineSlotCount < coreHeadCount);
+        }
         ++result.activeTaskCount;
         result.rightGmReady = result.rightGmReady || plan.stage2Required;
         result.alphaReady = result.alphaReady ||
                             (plan.gateMode == GateMode::ScalarG && plan.stage2Required);
+    }
+    if (coreHeadCount > 0) {
+        const CoreHeadBinding last =
+            BindAivCoreHead(plan, args.aivId, coreHeadCount - 1);
+        A5Stage1ConsumeHead(args, plan.heads[last.roundHead], last.pipelineSlot,
+                            /*hasNextSameSlot*/ false);
     }
     return result;
 }
@@ -743,7 +801,7 @@ inline void A5Stage3PrepareState(const VecStage3Args& args, const HeadBinding& h
     if (args.tiling->stateType == StateType::Bf16) {
         auto& state = args.memory->bf16State[FixedMemory::LocalBank(head)];
         if (state.owner == StateOwner::RNextMte3) {
-            args.sync->Wait(EventKind::StateToVFree, FixedMemory::LocalBank(head),
+            args.sync->Wait(EventKind::StateToVFree, head.localSlot,
                             /*下一 S3 VF*/ 3);
             args.memory->MarkBf16StateConsumedByNextVf(head);
         }
@@ -763,10 +821,12 @@ inline void A5Stage3PrepareState(const VecStage3Args& args, const HeadBinding& h
             UbFp32StateScratch(*args.memory), args.tiling->stateLayout);
     }
     args.memory->MarkFp32StateReady();
-    args.sync->Set(EventKind::StateReady, 0, /*state MTE2*/ 0, /*S3 VF*/ 3);
+    args.sync->Set(EventKind::StateMte2ToStage3VReady, 0,
+                   /*state MTE2*/ 0, /*S3 VF*/ 3);
 }
 
-inline void A5Stage3LoadGate(const VecStage3Args& args, const HeadBinding& head)
+inline void A5Stage3LoadGate(const VecStage3Args& args, const HeadBinding& head,
+                             int pipelineSlot)
 {
     // Stage3 门控公式：g-only 复用 Stage1 生成的 alpha_c = E(g_last)，gk-only 搬入 gk_c,h[M-1,:]。
     if (args.plan->gateMode != GateMode::KeyWiseGk) {
@@ -774,20 +834,23 @@ inline void A5Stage3LoadGate(const VecStage3Args& args, const HeadBinding& head)
     }
     Mte2CopyGkLastAsync(GkAtLast(*args.in, args.plan->chunk, head.hv),
                         UbGkLast(*args.memory, head));
-    WaitMte2ToVForStage3(head);
+    args.sync->Set(EventKind::S3Mte2ToVReady, pipelineSlot,
+                   /*A5 S3 MTE2*/ 0, /*A5 S3 VF*/ 3);
 }
 
 inline void A5Stage3ComputeAndWrite(const VecStage3Args& args,
-                                    const HeadBinding& head)
+                                    const HeadBinding& head,
+                                    int pipelineSlot,
+                                    bool publishGateFree)
 {
     // Stage3 计算公式：R_{c+1,h} = gate(R_c,h) + D_c,h；非末 chunk 将 H_{c+1,h} = cast_BF16(R_{c+1,h}) 写 GM。
     const RoundPlan& plan = *args.plan;
+    if (plan.gateMode == GateMode::KeyWiseGk) {
+        args.sync->Wait(EventKind::S3Mte2ToVReady, pipelineSlot, /*A5 S3 VF*/ 3);
+    }
     args.sync->Wait(EventKind::DReady, head.roundHead, /*S3 VF*/ 3);
-    if (args.tiling->stateType == StateType::Fp32 || plan.chunk.first) {
-        args.sync->Wait(EventKind::StateReady,
-                        args.tiling->stateType == StateType::Bf16
-                            ? FixedMemory::LocalBank(head) : 0,
-                        /*S3 VF*/ 3);
+    if (args.tiling->stateType == StateType::Fp32) {
+        args.sync->Wait(EventKind::StateMte2ToStage3VReady, 0, /*S3 VF*/ 3);
     }
 
     // A5 Stage3 的 gate、D、状态更新、H 派生全部由一个 RegBase VF 完成；运行期状态在 VF 外 dispatch。
@@ -808,12 +871,19 @@ inline void A5Stage3ComputeAndWrite(const VecStage3Args& args,
     a5_regbase::DispatchStage3Vf(vfCall, args.tiling->stateType, plan.gateMode,
                                  !plan.chunk.last, args.tiling->useExp2);
     PipeBarrierVForA5RegBase();
+    if (publishGateFree) {
+        args.sync->Set(EventKind::S3VToMte2Free, pipelineSlot,
+                       /*A5 S3 VF*/ 3, /*下一 A5 S3 MTE2*/ 0);
+    }
+
+    args.sync->Set(EventKind::S3VToMte3Ready, pipelineSlot,
+                   /*A5 S3 VF*/ 3, /*A5 S3 MTE3*/ 1);
+    args.sync->Wait(EventKind::S3VToMte3Ready, pipelineSlot, /*A5 S3 MTE3*/ 1);
 
     if (!plan.chunk.last) {
         args.memory->ProduceHForS3(head.hSlot);
         Mte3WriteHLayoutAwareAsync(*args.out, *args.tiling, plan, head,
                                    UbHWriteTarget(*args.memory, head));
-        wait_mte3_hnext_done(head.hSlot);
         args.memory->MarkHReady(head.hSlot);
         args.sync->Set(EventKind::HGmReady, head.hSlot, /*S3 MTE3*/ 1,
                        /*下一 chunk S0 MTE2*/ 0);
@@ -823,37 +893,41 @@ inline void A5Stage3ComputeAndWrite(const VecStage3Args& args,
             args.tiling->stateType == StateType::Bf16
                 ? UbBf16State(*args.memory, head)
                 : UbFp32StateScratch(*args.memory));
-        wait_mte3_final_state_done(head.hv);
     }
 }
 
 inline void A5Stage3ReleaseStateAndD(const VecStage3Args& args,
-                                     const HeadBinding& head)
+                                     const HeadBinding& head,
+                                     bool hasNextCoreHead)
 {
     // Stage3 释放公式：D_c,h 最后一次读取、R_{c+1,h}/final_state 写出后，按下一 owner 释放 state 与 D。
     const RoundPlan& plan = *args.plan;
     if (args.tiling->stateType == StateType::Bf16) {
-        if (plan.hasNextChunk) {
+        if (plan.nextChunkNeedsStage3) {
             args.memory->MarkBf16StateMte3InFlight(head);
-            args.sync->Set(EventKind::StateToVFree, FixedMemory::LocalBank(head),
+            args.sync->Set(EventKind::StateToVFree, head.localSlot,
                            /*state MTE3*/ 1, /*下一 S3 VF*/ 3);
+        } else if (plan.hasNextChunk) {
+            args.memory->MarkBf16StateMte3InFlight(head);
         } else if (plan.nextRoundStartsWithS0) {
             args.memory->MarkBf16StateMte3InFlight(head);
-            args.sync->Set(EventKind::StateToMte2Free, FixedMemory::LocalBank(head),
+            args.sync->Set(EventKind::StateToMte2Free, head.localSlot,
                            /*state MTE3*/ 1, /*下一 S1 MTE2*/ 0);
         } else if (plan.nextRoundStartsWithS1NoP) {
             args.memory->MarkBf16StateMte3InFlight(head);
-            args.sync->Set(EventKind::StateToVFree, FixedMemory::LocalBank(head),
+            args.sync->Set(EventKind::StateToVFree, head.localSlot,
                            /*state MTE3*/ 1, /*下一 S1 VF*/ 1);
         } else {
             args.memory->ReleaseBf16StateAtTerminal(head);
         }
     } else {
-        const bool nextHeadUsesScratch = head.roundHead + 1 < plan.activeHvCount;
-        if (plan.hasNextChunk || plan.hasNextHeadRound || nextHeadUsesScratch) {
+        if (plan.nextChunkNeedsStage3 || plan.hasNextHeadRound || hasNextCoreHead) {
             args.memory->MarkFp32StateMte3InFlight();
             args.sync->Set(EventKind::StateToMte2Free, 0, /*state MTE3*/ 1,
                            /*下一 state MTE2*/ -1);
+        } else if (plan.hasNextChunk ||
+                   (plan.chunk.last && args.tiling->outputFinalState)) {
+            args.memory->MarkFp32StateMte3InFlight();
         } else {
             args.memory->ReleaseFp32StateScratch();
         }
@@ -865,6 +939,30 @@ inline void A5Stage3ReleaseStateAndD(const VecStage3Args& args,
     }
 }
 
+inline void A5Stage3PrefetchHead(const VecStage3Args& args, const HeadBinding& head,
+                                 int pipelineSlot, bool prefetchFp32State)
+{
+    // BF16 state 按 head 独立驻留。FP32 只有一个 shared scratch：核内首个 head
+    // 在 ping 阶段预取，后续 head 在消费阶段等待前一 head 释放后再 acquire。
+    if (args.tiling->stateType == StateType::Bf16 || prefetchFp32State) {
+        A5Stage3PrepareState(args, head);
+    }
+    A5Stage3LoadGate(args, head, pipelineSlot);
+}
+
+inline void A5Stage3ConsumeHead(const VecStage3Args& args, const HeadBinding& head,
+                                int pipelineSlot, bool hasNextCoreHead,
+                                bool hasNextSameSlot, bool fp32StatePrefetched)
+{
+    if (args.tiling->stateType == StateType::Fp32 && !fp32StatePrefetched) {
+        A5Stage3PrepareState(args, head);
+    }
+    const bool publishGateFree = args.plan->gateMode == GateMode::KeyWiseGk &&
+                                 (hasNextSameSlot || args.plan->hasNextChunk);
+    A5Stage3ComputeAndWrite(args, head, pipelineSlot, publishGateFree);
+    A5Stage3ReleaseStateAndD(args, head, hasNextCoreHead);
+}
+
 inline VecStageResult RunStage3Arch35(const VecStage3Args& args)
 {
     // Stage3 阶段公式：逐 head 完成 R_{c+1,h} = gate(R_c,h) + D_c,h，并按末 chunk 分支写 H/final_state。
@@ -873,16 +971,38 @@ inline VecStageResult RunStage3Arch35(const VecStage3Args& args)
     if (!plan.stage3Required) {
         return result;
     }
-    for (int i = 0; i < plan.activeHvCount; ++i) {
-        const HeadBinding& head = plan.heads[i];
-        A5Stage3PrepareState(args, head);
-        A5Stage3LoadGate(args, head);
-        A5Stage3ComputeAndWrite(args, head);
-        A5Stage3ReleaseStateAndD(args, head);
+    const int coreHeadCount = AivCoreHeadCount(plan, args.aivId);
+    for (int coreHeadId = 0; coreHeadId < coreHeadCount; ++coreHeadId) {
+        const CoreHeadBinding current = BindAivCoreHead(plan, args.aivId, coreHeadId);
+        const bool reusesGateSlot = coreHeadId >= kAivPipelineSlotCount ||
+                                    (plan.chunk.chunk > 0 &&
+                                     coreHeadId < kAivPipelineSlotCount);
+        if (plan.gateMode == GateMode::KeyWiseGk && reusesGateSlot) {
+            args.sync->Wait(EventKind::S3VToMte2Free, current.pipelineSlot,
+                            /*当前 A5 S3 MTE2*/ 0);
+        }
+        A5Stage3PrefetchHead(args, plan.heads[current.roundHead], current.pipelineSlot,
+                             /*prefetchFp32State*/ coreHeadId == 0);
+        if (coreHeadId > 0) {
+            const CoreHeadBinding previous =
+                BindAivCoreHead(plan, args.aivId, coreHeadId - 1);
+            A5Stage3ConsumeHead(args, plan.heads[previous.roundHead], previous.pipelineSlot,
+                                /*hasNextCoreHead*/ true,
+                                /*hasNextSameSlot*/
+                                previous.coreHeadId + kAivPipelineSlotCount < coreHeadCount,
+                                /*fp32StatePrefetched*/ previous.coreHeadId == 0);
+        }
         ++result.activeTaskCount;
         result.nextHReady = result.nextHReady || !plan.chunk.last;
         result.finalStateWritten = result.finalStateWritten ||
                                    (plan.chunk.last && args.tiling->outputFinalState);
+    }
+    if (coreHeadCount > 0) {
+        const CoreHeadBinding last =
+            BindAivCoreHead(plan, args.aivId, coreHeadCount - 1);
+        A5Stage3ConsumeHead(args, plan.heads[last.roundHead], last.pipelineSlot,
+                            /*hasNextCoreHead*/ false, /*hasNextSameSlot*/ false,
+                            /*fp32StatePrefetched*/ last.coreHeadId == 0);
     }
     return result;
 }

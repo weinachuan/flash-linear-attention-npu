@@ -100,11 +100,12 @@ inline void RunOneChunk(SchedulerContext& ctx, const RoundPlan& plan, KernelRole
     // S1 等待 PReady（如有），一次 VF 生成 V_new/右操作数；右操作数先经 MTE3 写 GM ND，
     // 由 S2 再搬成 L1 NZ 后才发布 RightL1Ready。
     RunStage1ByArch({&ctx.inputs, &ctx.outputs, &ctx.workspace, &ctx.tiling, &plan,
-                     &ctx.memory, &ctx.sync, variant});
+                     &ctx.memory, &ctx.sync, variant, ctx.aivId});
 
     if (FwdHStagePolicy::NeedStage2(plan)) {
         // S3 等待 DReady，更新 rolling state；末 chunk 按需写 final_state。
-        RunStage3ByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &plan, &ctx.memory, &ctx.sync});
+        RunStage3ByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &plan, &ctx.memory,
+                         &ctx.sync, ctx.aivId});
     }
 }
 
@@ -119,20 +120,34 @@ inline void RunFwdH(SchedulerContext& ctx, KernelRole role)
             // 先固定本 head_round 的 requiredKhCount 和每个 H_v -> kgSlot 映射。
             // 这些关系只依赖 HK/HV，与 chunk 无关；后续 chunk 只绑定 token payload。
             const RoundPlan headRoundPlan = BuildHeadRoundPlan(ctx.tiling, round);
-            if (round > 0 && role == KernelRole::Vector) {
-                // 上一 round 的 kg、H、W 及异步搬运全部排空后，才允许本 round 发起搬运。
-                const RoundPlan previousHeadRound = BuildHeadRoundPlan(ctx.tiling, round - 1);
+            const bool hasPreviousWorkRound = round > 0 || n > 0;
+            if (hasPreviousWorkRound) {
+                // AIC 与每个 AIV 都必须完成本角色的动态 round drain；不能只让 AIV 等待，
+                // 否则 AIC 仍可能提前发起下一 round 的 H/W/kg MTE2。
+                const auto& previousSeq = round > 0 ? seq : ctx.tiling.sequences[n - 1];
+                const int previousRoundId = round > 0
+                                                ? round - 1
+                                                : static_cast<int>((ctx.tiling.hv - 1) /
+                                                                   kMaxRoundHeads);
+                const RoundPlan previousHeadRound =
+                    BuildHeadRoundPlan(ctx.tiling, previousRoundId);
                 const RoundPlan previousRound =
-                    BuildChunkPlan(previousHeadRound, ctx.tiling, seq, seq.chunkCount - 1);
-                ctx.sync.WaitBeforeNextRound(previousRound);
-                ctx.memory.ReleaseStateAfterRoundBarrier(previousRound);
+                    BuildChunkPlan(previousHeadRound, ctx.tiling, previousSeq,
+                                   previousSeq.chunkCount - 1);
+                if (role == KernelRole::Cube) {
+                    ctx.sync.WaitCubeBeforeNextRound(previousRound);
+                } else {
+                    ctx.sync.WaitVectorBeforeNextRound(previousRound, ctx.aivId);
+                    ctx.memory.ReleaseStateAfterRoundBarrier(previousRound, ctx.aivId);
+                }
             }
 
             if (role == KernelRole::Vector) {
                 // S-1 是当前 round 的生产者，必须在屏障后执行，并在首个 S0 前排空。
                 RunSMinusOneByArch({&ctx.inputs, &ctx.outputs, &ctx.tiling, &seq,
                                     &ctx.memory, &ctx.sync, headRoundPlan.activeHvBegin,
-                                    headRoundPlan.activeHvCount, round > 0});
+                                    headRoundPlan.activeHvCount, hasPreviousWorkRound,
+                                    ctx.aivId});
             }
 
             for (int c = 0; c < seq.chunkCount; ++c) {
@@ -140,8 +155,20 @@ inline void RunFwdH(SchedulerContext& ctx, KernelRole role)
                 const RoundPlan plan = BuildChunkPlan(headRoundPlan, ctx.tiling, seq, c);
                 RunOneChunk(ctx, plan, role);
             }
-            if (role == KernelRole::Vector) {
-                ctx.sync.Set(EventKind::TerminalDrain, round, /*round 生产者*/ 1, /*调度器*/ -1);
+            const RoundPlan terminalPlan =
+                BuildChunkPlan(headRoundPlan, ctx.tiling, seq, seq.chunkCount - 1);
+            const bool hasNextWorkRound = (round + 1) * kMaxRoundHeads < ctx.tiling.hv ||
+                                          n + 1 < ctx.tiling.sequenceCount;
+            if (role == KernelRole::Cube) {
+                if (hasNextWorkRound) {
+                    ctx.sync.PublishCubeRoundDrain(terminalPlan);
+                } else {
+                    ctx.sync.DrainCubeAtKernelExit(terminalPlan);
+                }
+            } else if (hasNextWorkRound) {
+                ctx.sync.PublishVectorRoundDrain(terminalPlan, ctx.aivId);
+            } else {
+                ctx.sync.DrainVectorAtKernelExit(terminalPlan, ctx.aivId);
             }
         }
     }
@@ -333,6 +360,7 @@ public:
     __aicore__ inline void Process()
     {
         // AIV 执行 S-1、Stage1 和 Stage3；所有 VF 入口在各自 arch 文件中完成。
+        ctx_.aivId = GetSubBlockIdx();
         RunFwdH(ctx_, KernelRole::Vector);
     }
 

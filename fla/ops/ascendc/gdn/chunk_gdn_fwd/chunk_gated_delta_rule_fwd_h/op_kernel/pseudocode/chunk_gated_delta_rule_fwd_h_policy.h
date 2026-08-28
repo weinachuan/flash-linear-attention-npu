@@ -11,9 +11,31 @@ namespace fwd_h_pseudocode {
 enum class Stage1Variant { WithP, NoP, v_new_only };
 
 enum class EventKind {
+    // 下列 Stage 内事件按执行核类型分槽：AIC 使用 coreHeadId=0..3，AIV 使用本地 coreHeadId=0..1。
+    // Set 必须紧跟本 slot 的最后一条 producer 指令，不能挪到另一 slot 的指令之后。
+    SMinusVToMte3Ready,
+    S0Mte2ToMte1Ready,
+    S0Mte1ToCubeReady,
+    S0CubeToFixpipeReady,
+    S0FixpipeToMte2Ready,
+    S0CubeToMte1Free,
+    S0FixpipeToCubeFree,
+    S1Mte2ToVReady,
+    S1VToMte3Ready,
+    S1Mte3ToMte2Free,
+    S2Mte2ToMte1Ready,
+    S2Mte1ToCubeReady,
+    S2CubeToFixpipeReady,
+    S2FixpipeToMte2Ready,
+    S2CubeToMte1Free,
+    S2FixpipeToCubeFree,
+    S3Mte2ToVReady,
+    S3VToMte3Ready,
+    S3VToMte2Free,
+    StateInitToH0Ready,       // arch22 S1 MTE2/V -> H0 MTE3
+    StateInitToStage1VReady,  // arch35 S1 MTE2 -> 单次 RegBase VF
+    StateMte2ToStage3VReady,  // FP32 rolling state MTE2 -> S3 VF
     InitialInputReady, // S-1 MTE2 -> S-1 VF
-    InitialInputFree,  // S-1 VF -> 下一代 S-1 MTE2
-    InitialPhaseDrain, // 当前 round 全部 S-1 MTE3 完成
     HGmReady,          // S-1/S3 MTE3(GM layout-aware) -> 下一 S0 MTE2
     HReady,            // S0 MTE2(GM -> L1 NZ) -> S0 MTE1
     HFree,             // S0 MTE1 -> 下一 H owner
@@ -32,13 +54,11 @@ enum class EventKind {
     DReady,            // S2 结果写回并进入 UB -> S3 VF
     DgmFree,           // arch22 L0C -> GM -> MTE2 完成 -> 下一 arch22 D GM writer
     DFree,             // S3 VF 最后一次读取 D -> 下一 local data owner
-    VNewWorkFree,      // S1 V_new 相关 MTE3 -> 下一 S1 MTE2
     StateToVFree,      // state MTE3 -> 下一 Vector consumer
     StateToMte2Free,   // state MTE3 -> 下一 state MTE2 producer
     UnionFree,         // 特定 v_new-only union -> 下一真实 AIC S0
-    StateReady,        // S1/状态 MTE2 -> S3 VF
-    StateFree,         // 状态最后消费者 -> 下一状态 owner
-    TerminalDrain,     // round/sequence 末尾所有异步搬运
+    CubeRoundDrain,    // 当前 AIC round 的 MTE2/MTE1/Cube/Fixpipe 全部排空
+    VectorRoundDrain,  // 当前 AIV round 的 MTE2/V/MTE3 全部排空
 };
 
 class SyncLedger;
@@ -89,15 +109,18 @@ class SyncLedger {
 public:
     void Set(EventKind kind, int slot, int producer, int consumer)
     {
-        // 只有生产者 pipe 完成写入后才能 Set；每个 Set 都必须有一个对应的 Wait。
+        // Stage 内事件对应 SetFlag<producer_consumer>(eventId[kind][slot])；AIC/AIV
+        // 所有权交接事件对应具名 CrossCoreSetFlag 路由。两者都只覆盖 producer pipe
+        // 在 Set 前的指令，因此当前槽的 Set 必须位于下一槽搬运之前。Set 本身不 Wait。
         if (recordCount_ < static_cast<int>(records_.size())) {
-            records_[recordCount_++] = {kind, slot, producer, consumer, NewToken()};
+            records_[recordCount_++] = {kind, slot, producer, consumer, NewToken(kind, slot)};
         }
     }
 
     void Wait(EventKind kind, int slot, int consumer)
     {
-        // Wait 必须使用匹配的 generation 和 pipe 对，禁止手工重置 token。
+        // 按 kind 的路由对应 WaitFlag 或 CrossCoreWaitFlag。只等待本 slot、本代际；
+        // 当前槽 consumer 不等待其他槽 ready，且不同 AIV 不消费彼此的本核 EventID。
         (void)kind;
         (void)slot;
         (void)consumer;
@@ -110,70 +133,123 @@ public:
         Set(kind, slot, consumer, /*下一 owner*/ -1);
     }
 
-    void WaitBeforeNextRound(const RoundPlan& previousRound)
+    void WaitCubeBeforeNextRound(const RoundPlan& previousRound)
     {
-        // 这是强制的跨 round 屏障。即使下一 round 再次出现相同 kh，
-        // 也必须在任何 H/W 搬运或 Stage2 kg 搬运之前调用它。
+        // AIC 的强制跨 round 屏障。循环上界全部取上一 round 的实际有效数量，
+        // 1/2/3/4-head round 只等待真实生成的 token，不补齐未激活的 AIC slot。
         if (previousRound.stage2Required) {
             for (int i = 0; i < previousRound.requiredKhCount; ++i) {
-                Wait(EventKind::kg_overwrite_safe, previousRound.kg[i].slot, /*下一 round 生产者*/ -1);
+                Wait(EventKind::kg_overwrite_safe, previousRound.kg[i].slot,
+                     /*下一 round kg MTE2*/ 0);
             }
         }
         if (previousRound.stage0Required) {
             for (int i = 0; i < previousRound.activeHvCount; ++i) {
-                Wait(EventKind::WFree, previousRound.heads[i].wSlot, /*下一 round 生产者*/ -1);
-                Wait(EventKind::HFree, previousRound.heads[i].hSlot, /*下一 round 生产者*/ -1);
+                Wait(EventKind::WFree, previousRound.heads[i].wSlot, /*下一 round W MTE2*/ 0);
+                Wait(EventKind::HFree, previousRound.heads[i].hSlot, /*下一 round H MTE2*/ 0);
                 Wait(EventKind::PFree, previousRound.heads[i].roundHead, /*下一 round S0 Fixpipe*/ 0);
             }
         }
         if (previousRound.stage2Required) {
-            // D 是上一轮 S2 的输出；即使本轮没有 S0，也要等 S3 读完 D 后才能复用 local data。
             for (int i = 0; i < previousRound.activeHvCount; ++i) {
                 Wait(EventKind::DFree, previousRound.heads[i].roundHead, /*下一 round local data producer*/ -1);
             }
-            // 右操作数的 GM scratch 也按 head_round slot 复用；Stage2 MTE2 完成前
-            // 下一 round 不得重新写同一 ND scratch。
+        }
+        Wait(EventKind::CubeRoundDrain, previousRound.round, /*下一 round AIC 调度器*/ -1);
+    }
+
+    void WaitVectorBeforeNextRound(const RoundPlan& previousRound, int aivId)
+    {
+        // 每个 AIV 只等待自己上一 round 实际处理的 roundHead。另一 AIV 没有隐式顺序，
+        // 也不能消费本核没有生产的本地槽 EventID。
+        if (previousRound.stage2Required) {
             for (int i = 0; i < previousRound.activeHvCount; ++i) {
-                Wait(EventKind::RightGmFree, previousRound.heads[i].roundHead,
-                     /*下一 round S1 GM producer*/ -1);
+                const HeadBinding& head = previousRound.heads[i];
+                if (head.aiv == aivId) {
+                    Wait(EventKind::RightGmFree, head.roundHead,
+                         /*下一 round S1 GM producer*/ -1);
+                }
             }
         }
         if (previousRound.hasNextHeadRound) {
-            // S1 的 V_new/right GM MTE3 可能仍读取 UB work bank；下一 round 的 S-1 或 S1
-            // 不能靠 head loop 的自然顺序覆写它。
-            for (int i = 0; i < previousRound.activeHvCount; ++i) {
-                const int bank = (i % kAivCount) * kLocalSlotsPerAiv + (i / kAivCount);
-                Wait(EventKind::VNewWorkFree, bank,
-                     /*下一 round producer*/ -1);
-            }
             if (previousRound.stage3Required) {
                 for (int i = 0; i < previousRound.activeHvCount; ++i) {
+                    const HeadBinding& head = previousRound.heads[i];
+                    if (head.aiv != aivId) {
+                        continue;
+                    }
                     if (previousRound.stateType == StateType::Bf16) {
-                        const int bank = (i % kAivCount) * kLocalSlotsPerAiv + (i / kAivCount);
                         if (previousRound.nextRoundStartsWithS0) {
-                            Wait(EventKind::StateToMte2Free, bank, /*下一 round S1 MTE2*/ 0);
+                            Wait(EventKind::StateToMte2Free, head.localSlot,
+                                 /*下一 round S1 MTE2*/ 0);
                         } else if (previousRound.nextRoundStartsWithS1NoP) {
-                            Wait(EventKind::StateToVFree, bank, /*下一 round S1 VF*/ 1);
+                            Wait(EventKind::StateToVFree, head.localSlot,
+                                 /*下一 round S1 VF*/ 1);
                         }
-                    } else if (i == 0) {
-                        // FP32 state 使用单个 shared scratch，下一 round 的第一个 S3 负责重新 MTE2。
+                    } else if (head.localSlot == 0) {
+                        // FP32 scratch 在每个 AIV 内共享，只由本 AIV 的首个 coreHead 等一次。
                         Wait(EventKind::StateToMte2Free, 0, /*下一 round state MTE2*/ 0);
                     }
                 }
             }
         }
-        Wait(EventKind::TerminalDrain, previousRound.round, /*调度器*/ -1);
+        Wait(EventKind::VectorRoundDrain, previousRound.round, /*下一 round AIV 调度器*/ -1);
+    }
+
+    void PublishCubeRoundDrain(const RoundPlan& terminalPlan)
+    {
+        // 伪代码接口：按 terminalPlan.activeHvCount/requiredKhCount 排空最后一代实际存在的
+        // MTE2、MTE1、Cube、Fixpipe 事件后，再由 AIC 发布一个可供下一 work-round 消费的 token。
+        // 落地时必须选目标 CANN 明确支持的 HardEvent 组合，不能用 PIPE_V barrier 代替。
+        DrainOutstandingCubePipes(terminalPlan);
+        Set(EventKind::CubeRoundDrain, terminalPlan.round, /*AIC drain*/ 0,
+            /*下一 AIC work-round*/ -1);
+    }
+
+    void PublishVectorRoundDrain(const RoundPlan& terminalPlan, int aivId)
+    {
+        // 只枚举本 AIV 实际分到的 localSlot，排空 MTE2/V/MTE3；不存在的 pong 不参与。
+        DrainOutstandingVectorPipes(terminalPlan, aivId);
+        Set(EventKind::VectorRoundDrain, terminalPlan.round, /*AIV drain*/ 1,
+            /*下一 AIV work-round*/ -1);
+    }
+
+    void DrainCubeAtKernelExit(const RoundPlan& terminalPlan)
+    {
+        // 最后一个 work-round 没有 token 消费者；直接排空后返回 kernel。
+        DrainOutstandingCubePipes(terminalPlan);
+    }
+
+    void DrainVectorAtKernelExit(const RoundPlan& terminalPlan, int aivId)
+    {
+        DrainOutstandingVectorPipes(terminalPlan, aivId);
     }
 
 private:
-    EventToken NewToken()
+    void DrainOutstandingCubePipes(const RoundPlan& terminalPlan)
     {
-        return EventToken{nextId_++, nextGeneration_++, true};
+        // 伪代码：真实实现逐个关闭仍在途的 slot/pipe 代际。
+        (void)terminalPlan;
+    }
+
+    void DrainOutstandingVectorPipes(const RoundPlan& terminalPlan, int aivId)
+    {
+        // 伪代码：真实实现只处理 head.aiv == aivId 的有效本地槽。
+        (void)terminalPlan;
+        (void)aivId;
+    }
+
+    EventToken NewToken(EventKind kind, int slot)
+    {
+        // 本核物理键是 (HardEvent pipe 对, pipelineSlot)，跨核物理键还包含同步方向和参与核。
+        // kind 在伪代码中保留完整路由身份；id 只是该路由内的 slot 序号。真实实现通过
+        // AllocEventID/FetchEventID 或集中 flag 表分配，并在上一代闭环后复用有限资源。
+        (void)kind;
+        return EventToken{slot, nextGeneration_++, true};
     }
 
     std::array<EventRecord, 256> records_{};
     int recordCount_ = 0;
-    int nextId_ = 0;
     uint64_t nextGeneration_ = 1;
 };
 
@@ -404,13 +480,16 @@ public:
         fp32StateScratch.owner = StateOwner::Free;
     }
 
-    void ReleaseStateAfterRoundBarrier(const RoundPlan& previousRound)
+    void ReleaseStateAfterRoundBarrier(const RoundPlan& previousRound, int aivId)
     {
-        // WaitBeforeNextRound 已经排空异步 state MTE3；把 owner 显式归还，
-        // 使下一 round 的首块 S1 初始化或 S3 MTE2 不再依赖旧 round 的 owner。
+        // WaitVectorBeforeNextRound 已经排空本 AIV 的异步 state MTE3；只归还本核
+        // 实际拥有的 bank，不能替另一 AIV 修改 owner。
         if (previousRound.stateType == StateType::Bf16) {
             for (int i = 0; i < previousRound.activeHvCount; ++i) {
-                bf16State[LocalBank(previousRound.heads[i])].owner = StateOwner::Free;
+                const HeadBinding& head = previousRound.heads[i];
+                if (head.aiv == aivId) {
+                    bf16State[LocalBank(head)].owner = StateOwner::Free;
+                }
             }
         } else {
             fp32StateScratch.owner = StateOwner::Free;
@@ -535,6 +614,7 @@ struct SchedulerContext {
     TilingPlan tiling{};
     FixedMemory memory{};
     SyncLedger sync{};
+    int aivId = 0; // 当前 AIV 子核：0 处理 roundHead 0/2，1 处理 roundHead 1/3
 };
 
 } // 命名空间 fwd_h_pseudocode

@@ -251,6 +251,40 @@ inline RoundPlan BuildHeadRoundPlan(const TilingPlan& tiling, int round)
     return plan;
 }
 
+inline int AicPipelineSlot(int coreHeadId)
+{
+    // AIC 的四个 round head 各自占用独立物理槽，本轮内不存在槽复用。
+    return coreHeadId;
+}
+
+inline int AivPipelineSlot(int coreHeadId)
+{
+    // 每个 AIV 最多处理两个本地 head，coreHeadId 直接对应本 AIV 的两个槽。
+    return coreHeadId;
+}
+
+inline CoreHeadBinding BindAicCoreHead(const RoundPlan& plan, int coreHeadId)
+{
+    // AIC: roundHead 0/1/2/3 -> AIC slot 0/1/2/3；未激活的槽不参与本轮。
+    (void)plan;
+    return CoreHeadBinding{coreHeadId, coreHeadId, AicPipelineSlot(coreHeadId)};
+}
+
+inline int AivCoreHeadCount(const RoundPlan& plan, int aivId)
+{
+    // roundHead=aivId+2*coreHeadId；不足四个 head 时只返回本 AIV 的有效数量。
+    const int remaining = plan.activeHvCount - aivId;
+    return remaining > 0 ? (remaining + kAivCount - 1) / kAivCount : 0;
+}
+
+inline CoreHeadBinding BindAivCoreHead(const RoundPlan& plan, int aivId, int coreHeadId)
+{
+    // AIV0: roundHead 0/2 -> 本地槽 0/1；AIV1: roundHead 1/3 -> 本地槽 0/1。
+    (void)plan;
+    const int roundHead = aivId + coreHeadId * kAivCount;
+    return CoreHeadBinding{coreHeadId, roundHead, AivPipelineSlot(coreHeadId)};
+}
+
 // 将当前 chunk 的 token 范围和 Stage 分支绑定到已经确定的 head_round 计划。
 // 这里只改变 chunk/sequence 字段，不重新计算 H_v -> H_k，也不重新分配 kg slot。
 inline RoundPlan BuildChunkPlan(const RoundPlan& headRound, const TilingPlan& tiling,
@@ -264,10 +298,13 @@ inline RoundPlan BuildChunkPlan(const RoundPlan& headRound, const TilingPlan& ti
     plan.stage0Required = !(plan.chunk.first && !tiling.useInitialState);
     plan.finalVNewOnly = plan.chunk.last && !tiling.outputFinalState;
     plan.hasNextChunk = !plan.chunk.last;
+    // 下一 chunk 若是最终 v_new-only，则不会消费 rolling state，不能为它发布 StateTo* token。
+    plan.nextChunkNeedsStage3 = plan.hasNextChunk &&
+                                (tiling.outputFinalState || chunk + 2 < seq.chunkCount);
     plan.hasNextHeadRound = (plan.round + 1) * kMaxRoundHeads < tiling.hv;
     plan.nextRoundStartsWithS0 = plan.hasNextHeadRound && tiling.useInitialState;
     plan.nextRoundStartsWithS1NoP = plan.hasNextHeadRound && !tiling.useInitialState;
-    plan.roundBoundaryDrained = plan.round > 0 && plan.chunk.first;
+    plan.roundBoundaryDrained = plan.chunk.first && (plan.round > 0 || plan.sequence > 0);
     return plan;
 }
 

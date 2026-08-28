@@ -16,6 +16,10 @@ constexpr int kMaxRoundHeads = 4;
 constexpr int kAivCount = 2;
 constexpr int kLocalSlotsPerAiv = 2;
 constexpr int kMaxKeySlots = 4;
+constexpr int kAicPipelineSlotCount = 4; // 一个 AIC 同时服务四个 round head，各 head 独占一槽
+constexpr int kAivPipelineSlotCount = 2; // 一个 AIV 最多服务两个本地 head，使用两个本地槽
+static_assert(kAicPipelineSlotCount == kMaxRoundHeads);
+static_assert(kAivPipelineSlotCount == kLocalSlotsPerAiv);
 
 enum class GateMode { ScalarG, KeyWiseGk };
 enum class StateType { Bf16, Fp32 };
@@ -113,6 +117,12 @@ struct HeadBinding {
     bool active = false;
 };
 
+struct CoreHeadBinding {
+    int coreHeadId = -1; // 当前 AIC/AIV 核内连续编号，不等同于 roundHead
+    int roundHead = -1;  // 当前 head_round 的全局编号
+    int pipelineSlot = -1; // AIC 为 0..3；每个 AIV 的本地槽为 0..1
+};
+
 struct kg_binding {
     int slot = -1;
     int kh = -1;
@@ -155,6 +165,7 @@ struct RoundPlan {
     bool stage3Required = false;
     bool finalVNewOnly = false;
     bool hasNextChunk = false;
+    bool nextChunkNeedsStage3 = false;
     bool hasNextHeadRound = false;
     bool nextRoundStartsWithS0 = false;
     bool nextRoundStartsWithS1NoP = false;
@@ -197,8 +208,8 @@ struct TilingPlan {
 // useExp2/stateVFirst：设计文档要求透传到 kernel 的属性；
 // 六个 workspace offset：GM workspace 子区的起始字节偏移。
 //
-// 当前仓库的真实 op_host tiling 还没有同时写入 useExp2/stateVFirst；落地时必须在
-// host/kernel 两侧以相同顺序补齐，不能在 kernel 中猜默认值或依赖外部转置。
+// 真实 op_host tiling 已在同一顺序写入 useExp2/stateVFirst；kernel 直接读取这两个字段，
+// 不能在设备侧猜默认值或依赖外部转置。
 struct KernelTilingData {
     int64_t batch = 0;
     int64_t seqlen = 0;

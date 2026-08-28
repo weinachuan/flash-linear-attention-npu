@@ -40,14 +40,12 @@ inline void Arch22Mte2PFromGmToUb(const CubeStage0Args& args, const HeadBinding&
     Mte2CopyPFromGmToUbArch22(Arch22PScratch(*args.workspace, head.roundHead),
                               UbP(*args.memory, head), args.plan->chunk,
                               args.tiling->stateType);
-    wait_mte2_p_ub_done_arch22(head.roundHead);
 }
 
 inline void Arch22Mte2DFromGmToUb(const CubeStage2Args& args, const HeadBinding& head)
 {
     Mte2CopyDFromGmToUbArch22(Arch22DScratch(*args.workspace, head.roundHead),
                               UbD(*args.memory, head), args.plan->chunk);
-    wait_mte2_d_ub_done_arch22(head.roundHead);
 }
 
 // ------------------------------- Stage 0 helpers -------------------------------
@@ -67,7 +65,6 @@ inline void Stage0LoadHArch22(const CubeStage0Args& args, const HeadBinding& hea
         args.memory->AcquireHForS0(head.hSlot);
         Mte2StateToCanonicalHArch22(*args.in, head.hv, args.tiling->stateLayout,
                                     L1H(args.memory->l1, head.hSlot));
-        wait_mte2_h_l1_done_arch22(head.hSlot);
         args.memory->MarkHReady(head.hSlot);
         args.sync->Set(EventKind::HReady, head.hSlot, /*S0 MTE2*/ 0,
                        /*S0 MTE1*/ 1);
@@ -77,10 +74,13 @@ inline void Stage0LoadHArch22(const CubeStage0Args& args, const HeadBinding& hea
     // FP32 initial 来自 S-1；后续 chunk 来自前一个 chunk 的 S3。producer 先把 layout-aware H
     // 写到 GM，S0 再用 MTE2 搬成 L1 NZ；禁止把 UB 数据直接写入 L1。
     args.sync->Wait(EventKind::HGmReady, head.hSlot, /*S0 MTE2*/ 0);
+    if (plan.chunk.chunk > 0) {
+        // L1 H 与上一 chunk 的 right 使用同一物理 slot；只等本 head 的最后一次 right MTE1。
+        args.sync->Wait(EventKind::RightFree, head.hSlot, /*S0 MTE2*/ 0);
+    }
     Mte2CopyHFromGmLayoutAwareToL1NzAsyncArch22(
         *args.out, *args.tiling, *args.plan, head,
         L1H(args.memory->l1, head.hSlot));
-    wait_mte2_h_l1_done_arch22(head.hSlot);
     args.sync->Set(EventKind::HReady, head.hSlot, /*S0 MTE2*/ 0,
                    /*S0 MTE1*/ 1);
     args.memory->BeginHReadFromS3(head.hSlot);
@@ -104,15 +104,27 @@ inline void Stage0LoadWArch22(const CubeStage0Args& args, const HeadBinding& hea
                    /*S0 MTE1*/ 1);
 }
 
-inline void Stage0ComputePArch22(const CubeStage0Args& args, const HeadBinding& head)
+inline void Stage0ComputePArch22(const CubeStage0Args& args, const HeadBinding& head,
+                                 int pipelineSlot)
 {
     // Stage0 计算公式：P_c,h = W_c,h @ H_c,h，矩阵乘为 BF16 x BF16 -> FP32 累加。
     // S0 MTE1 只读取本 Stage 的 W/H 输入；P 经过 A2 GM scratch 中转后进入本 head 的 local data bank。
+    if (args.plan->chunk.chunk > 0) {
+        // AIC 四槽在本 round 内互不复用；这里只接收上一 chunk Stage2 对同一物理槽的 free。
+        // 跨 round 已由动态 CubeRoundDrain 收口，不能等待上一 round 未必生成的槽级 token。
+        args.sync->Wait(EventKind::S2CubeToMte1Free, pipelineSlot, /*S0 MTE1*/ 1);
+    }
+    args.sync->Wait(EventKind::S0Mte2ToMte1Ready, pipelineSlot, /*S0 MTE1*/ 1);
     args.sync->Wait(EventKind::WReady, head.wSlot, /*S0 MTE1*/ 1);
     args.sync->Wait(EventKind::HReady, head.hSlot, /*S0 MTE1*/ 1);
     Mte1LoadArch22(L1W(args.memory->l1, head.wSlot), L0AArch22(head));
     Mte1LoadArch22(L1H(args.memory->l1, head.hSlot), L0BArch22(head));
-    Mte1ToCubeReadyArch22(/*W/H 已全部进入 L0*/ head);
+    args.sync->Set(EventKind::S0Mte1ToCubeReady, pipelineSlot,
+                   /*S0 MTE1*/ 1, /*S0 Cube*/ 2);
+    args.sync->Wait(EventKind::S0Mte1ToCubeReady, pipelineSlot, /*S0 Cube*/ 2);
+    if (args.plan->chunk.chunk > 0) {
+        args.sync->Wait(EventKind::S2FixpipeToCubeFree, pipelineSlot, /*S0 Cube*/ 2);
+    }
 
     const auto& localData = args.memory->localData[FixedMemory::LocalBank(head)];
     if (localData.generation > 0 && !args.plan->roundBoundaryDrained) {
@@ -127,11 +139,26 @@ inline void Stage0ComputePArch22(const CubeStage0Args& args, const HeadBinding& 
     args.memory->AcquireLocalDataForP(head);
     const auto pAcc = MmadBf16AccFp32Arch22(L0AArch22(head), L0BArch22(head),
                                                args.plan->chunk.validTokens);
+    if (args.plan->stage2Required) {
+        // MMAD 已完成 L0A/L0B 末读；仅为当前 chunk Stage2 复用同一 AIC 槽发布 free。
+        args.sync->Set(EventKind::S0CubeToMte1Free, pipelineSlot,
+                       /*S0 Cube*/ 2, /*当前 S2 MTE1*/ 1);
+    }
+    args.sync->Set(EventKind::S0CubeToFixpipeReady, pipelineSlot,
+                   /*S0 Cube*/ 2, /*S0 Fixpipe*/ 3);
+    args.sync->Wait(EventKind::S0CubeToFixpipeReady, pipelineSlot, /*S0 Fixpipe*/ 3);
     // A2/A3 没有 L0C -> UB，P 走 L0C -> GM -> MTE2 -> UB；StateT 决定 GM 中转时的量化格式。
     wait_arch22_p_gm_slot_free(Arch22PScratch(*args.workspace, head.roundHead));
     FixpipePByStateTypeToGmArch22(pAcc, Arch22PScratch(*args.workspace, head.roundHead),
                                   args.plan->chunk, args.tiling->stateType);
-    wait_fixpipe_p_gm_done_arch22(head.roundHead);
+    args.sync->Set(EventKind::S0FixpipeToMte2Ready, pipelineSlot,
+                   /*S0 Fixpipe*/ 3, /*S0 MTE2*/ 0);
+    if (args.plan->stage2Required) {
+        // Fixpipe 已完成 L0C 末读；仅解锁当前 chunk Stage2 对同一 AIC 槽 L0C 的覆盖。
+        args.sync->Set(EventKind::S0FixpipeToCubeFree, pipelineSlot,
+                       /*S0 Fixpipe*/ 3, /*当前 S2 Cube*/ 2);
+    }
+    args.sync->Wait(EventKind::S0FixpipeToMte2Ready, pipelineSlot, /*S0 MTE2*/ 0);
     Arch22Mte2PFromGmToUb(args, head);
     args.memory->MarkPReady(head);
     args.sync->Set(EventKind::PReady, head.roundHead, /*A2 S0 MTE2 GM->UB*/ 0,
@@ -156,12 +183,24 @@ inline CubeStageResult RunStage0Arch22(const CubeStage0Args& args)
     }
     PrepareArch22CubeWorkspace(*args.workspace, *args.tiling);
 
-    for (int i = 0; i < plan.activeHvCount; ++i) {
-        const HeadBinding& head = plan.heads[i];
+    for (int coreHeadId = 0; coreHeadId < plan.activeHvCount; ++coreHeadId) {
+        const CoreHeadBinding current = BindAicCoreHead(plan, coreHeadId);
+        const HeadBinding& head = plan.heads[current.roundHead];
         Stage0LoadHArch22(args, head);
         Stage0LoadWArch22(args, head);
-        Stage0ComputePArch22(args, head);
+        args.sync->Set(EventKind::S0Mte2ToMte1Ready, current.pipelineSlot,
+                       /*S0 MTE2*/ 0, /*S0 MTE1*/ 1);
+        if (coreHeadId > 0) {
+            const CoreHeadBinding previous = BindAicCoreHead(plan, coreHeadId - 1);
+            Stage0ComputePArch22(args, plan.heads[previous.roundHead],
+                                 previous.pipelineSlot);
+        }
         ++result.activeTaskCount;
+    }
+    if (plan.activeHvCount > 0) {
+        const int lastCoreHeadId = plan.activeHvCount - 1;
+        const CoreHeadBinding last = BindAicCoreHead(plan, lastCoreHeadId);
+        Stage0ComputePArch22(args, plan.heads[last.roundHead], last.pipelineSlot);
     }
     result.produced = true;
     return result;
@@ -191,53 +230,58 @@ inline void Stage2LoadKgForRoundArch22(const CubeStage2Args& args)
         Mte2CopyValidRowsAsyncArch22(
             /*源=*/KeyPayload(*args.in, plan.chunk, binding.kh, binding.payload),
             /*目的=*/l1_kg(args.memory->l1, binding.slot), plan.chunk.validTokens);
-        // MTE2 先异步发起；Stage2 的首个 mapped head 等待该 slot 完成后再做 MTE1。
+        args.memory->mark_kg_ready(binding.slot);
+        args.sync->Set(EventKind::kg_ready, binding.slot, /*kg MTE2*/ 0,
+                       /*S2 MTE1*/ 2);
     }
 }
 
 inline void Stage2EnsureKgReadyArch22(const CubeStage2Args& args, const kg_binding& binding)
 {
     // Stage2 kg 就绪语义：kg_c,kh[M,K] 完整搬入 L1 后，才允许映射到该 slot 的 head 做 MTE1。
-    auto& ticket = args.memory->kg[binding.slot];
-    if (ticket.state != SlotState::Loading) {
-        // 同一 kg slot 的后续 mapped head 直接复用已经 ready 的 entry。
-        return;
-    }
-    // Stage2LoadKgForRound 已经发起本代 MTE2；这里只等待一次，不重复读取 GM。
-    wait_mte2_kg_done_arch22(binding.slot);
-    args.memory->mark_kg_ready(binding.slot);
-    args.sync->Set(EventKind::kg_ready, binding.slot, /*kg MTE2*/ 0,
-                   /*S2 MTE1*/ 2);
+    // ready 已紧跟本 kg slot 的 MTE2 发布，不能在消费点等待全部 MTE2 后才 Set。
+    (void)args;
+    (void)binding;
 }
 
-inline void Stage2PrefetchRightToL1NzArch22(const CubeStage2Args& args, const HeadBinding& head)
+inline void Stage2PrefetchRightToL1NzArch22(const CubeStage2Args& args,
+                                            const HeadBinding& head,
+                                            int pipelineSlot)
 {
     // Stage2 右操作数预取公式：g-only 搬 V_new_g,c,h，gk-only 搬 V_new_c,h；两者均由 ND 转为 NZ。
     const int rightGmSlot = head.roundHead;
     // Stage1 已经把 UB ND 写入 GM；先等 GM 写出，再异步发起 Stage2 的 ND -> NZ 搬运。
     args.sync->Wait(EventKind::RightGmReady, rightGmSlot, /*S2 MTE2*/ 0);
+    if (args.plan->stage0Required) {
+        // 当前 chunk 的 H MTE1 末读后，才允许 right MTE2 覆盖同一 L1 slot。
+        args.sync->Wait(EventKind::HFree, head.hSlot, /*S2 MTE2*/ 0);
+    }
     args.memory->AcquireRightForS2Mte2(head.hSlot);
     Mte2CopyRightOperandGmNdToL1NzAsyncArch22(
         args.workspace->rightOperandGm, rightGmSlot, args.plan->chunk,
         L1Right(args.memory->l1, head.hSlot), args.plan->chunk.validTokens);
+    args.memory->MarkRightL1Ready(head.hSlot);
+    args.sync->Set(EventKind::RightL1Ready, head.hSlot, /*S2 MTE2*/ 0,
+                   /*S2 MTE1*/ 2);
+    args.sync->Set(EventKind::S2Mte2ToMte1Ready, pipelineSlot,
+                   /*S2 MTE2*/ 0, /*S2 MTE1*/ 2);
+    // GM scratch 的最后消费者就是当前 MTE2；free 必须紧跟本 head 的搬运，
+    // 不能到消费函数中才发布，否则会错误包含下一个 head 的 MTE2。
+    args.memory->ReleaseRightGmAfterS2Mte2(rightGmSlot);
+    args.sync->Set(EventKind::RightGmFree, rightGmSlot, /*S2 MTE2*/ 0,
+                   /*下一 S1 MTE3*/ 1);
 }
 
 inline void Stage2EnsureRightL1ReadyArch22(const CubeStage2Args& args, const HeadBinding& head)
 {
     // Stage2 右操作数就绪公式：L1Right_c,h[NZ] = convert_ND_to_NZ(V_new_g/V_new[GM])。
-    const int rightGmSlot = head.roundHead;
-    // 预取已经发起；每个 head 的 MTE1 只在本 head 的 L1 NZ 完成后继续。
-    wait_mte2_right_l1_done_arch22(head.hSlot);
-    args.memory->MarkRightL1Ready(head.hSlot);
-    // GM scratch 在 MTE2 完成后已经没有消费者，允许下一 chunk/round 的 Stage1 复用。
-    args.memory->ReleaseRightGmAfterS2Mte2(rightGmSlot);
-    args.sync->Set(EventKind::RightGmFree, rightGmSlot, /*S2 MTE2*/ 0,
-                   /*下一 S1 MTE3*/ 1);
-    args.sync->Set(EventKind::RightL1Ready, head.hSlot, /*S2 MTE2*/ 0,
-                   /*S2 MTE1*/ 2);
+    // ready/free 已由 producer 紧跟当前 head 的 MTE2 发布；这里只保留消费侧模块边界。
+    (void)args;
+    (void)head;
 }
 
-inline void Stage2ComputeDForHeadArch22(const CubeStage2Args& args, const HeadBinding& head)
+inline void Stage2ComputeDForHeadArch22(const CubeStage2Args& args, const HeadBinding& head,
+                                        int pipelineSlot)
 {
     // Stage2 计算公式：g-only 为 D_c,h = k_raw_c,kh^T @ V_new_g,c,h；gk-only 为 D_c,h = kg_c,kh^T @ V_new_c,h。
     const kg_binding& binding = args.plan->kg[head.kgSlot];
@@ -247,8 +291,13 @@ inline void Stage2ComputeDForHeadArch22(const CubeStage2Args& args, const HeadBi
     if (head.roundHead == binding.firstConsumerRoundHead) {
         args.sync->Wait(EventKind::kg_ready, binding.slot, /*S2 MTE1*/ 2);
     }
+    if (args.plan->stage0Required) {
+        // AIC 四槽在本 round 内互不复用；这里只接收当前 chunk Stage0 对同一物理槽的 free。
+        args.sync->Wait(EventKind::S0CubeToMte1Free, pipelineSlot, /*S2 MTE1*/ 2);
+    }
     // 子模块 Stage2EnsureRightL1Ready：确认预取的 GM ND -> L1 NZ 已完成。
     Stage2EnsureRightL1ReadyArch22(args, head);
+    args.sync->Wait(EventKind::S2Mte2ToMte1Ready, pipelineSlot, /*S2 MTE1*/ 2);
     // L1 NZ 已经由本 head 的 Stage2 MTE2 生成，之后才允许 MTE1 读右操作数。
     args.sync->Wait(EventKind::RightL1Ready, head.hSlot, /*S2 MTE1*/ 2);
     const auto& localData = args.memory->localData[FixedMemory::LocalBank(head)];
@@ -265,16 +314,34 @@ inline void Stage2ComputeDForHeadArch22(const CubeStage2Args& args, const HeadBi
 
     Mte1LoadArch22(l1_kg(args.memory->l1, binding.slot), L0AArch22(head));
     Mte1LoadArch22(L1Right(args.memory->l1, head.hSlot), L0BArch22(head));
-    Mte1ToCubeReadyArch22(/*kg/right 已全部进入 L0*/ head);
+    args.sync->Set(EventKind::S2Mte1ToCubeReady, pipelineSlot,
+                   /*S2 MTE1*/ 2, /*S2 Cube*/ 0);
+    args.sync->Wait(EventKind::S2Mte1ToCubeReady, pipelineSlot, /*S2 Cube*/ 0);
+    if (args.plan->stage0Required) {
+        args.sync->Wait(EventKind::S0FixpipeToCubeFree, pipelineSlot, /*S2 Cube*/ 0);
+    }
 
     // g-only 物理 kg slot 保存 k_raw，右操作数是 V_new_g；gk-only 保存 prepared kg，右操作数是 V_new。
     const auto dAcc = MmadBf16AccFp32Arch22(L0AArch22(head), L0BArch22(head),
                                                args.plan->chunk.validTokens);
+    if (args.plan->hasNextChunk) {
+        args.sync->Set(EventKind::S2CubeToMte1Free, pipelineSlot,
+                       /*S2 Cube*/ 0, /*下一 chunk S0 MTE1*/ 1);
+    }
+    args.sync->Set(EventKind::S2CubeToFixpipeReady, pipelineSlot,
+                   /*S2 Cube*/ 0, /*S2 Fixpipe*/ 3);
+    args.sync->Wait(EventKind::S2CubeToFixpipeReady, pipelineSlot, /*S2 Fixpipe*/ 3);
     // A2/A3 没有 L0C -> UB，D 也必须走独立 GM scratch 再由 MTE2 回到 UB。
     wait_arch22_d_gm_slot_free(Arch22DScratch(*args.workspace, head.roundHead));
     FixpipeDNoQuantToGmArch22(dAcc, Arch22DScratch(*args.workspace, head.roundHead),
                               args.plan->chunk);
-    wait_fixpipe_d_gm_done_arch22(head.roundHead);
+    args.sync->Set(EventKind::S2FixpipeToMte2Ready, pipelineSlot,
+                   /*S2 Fixpipe*/ 3, /*S2 MTE2*/ 0);
+    if (args.plan->hasNextChunk) {
+        args.sync->Set(EventKind::S2FixpipeToCubeFree, pipelineSlot,
+                       /*S2 Fixpipe*/ 3, /*下一 chunk S0 Cube*/ 2);
+    }
+    args.sync->Wait(EventKind::S2FixpipeToMte2Ready, pipelineSlot, /*S2 MTE2*/ 0);
     Arch22Mte2DFromGmToUb(args, head);
     args.memory->MarkDReady(head);
     args.sync->Set(EventKind::DReady, head.roundHead, /*A2 S2 MTE2 GM->UB*/ 0,
@@ -302,14 +369,21 @@ inline CubeStageResult RunStage2Arch22(const CubeStage2Args& args)
     PrepareArch22CubeWorkspace(*args.workspace, *args.tiling);
 
     Stage2LoadKgForRoundArch22(args);
-    // 先为本 round 的所有 value head 发起右操作数预取；后续每个 head 在 MTE1 前确认就绪。
-    for (int i = 0; i < plan.activeHvCount; ++i) {
-        Stage2PrefetchRightToL1NzArch22(args, plan.heads[i]);
-    }
-    // 每个 active value head 执行一次完整逻辑转置 MMAD；共享 kh 的 head 共享 L1 kg slot。
-    for (int i = 0; i < plan.activeHvCount; ++i) {
-        Stage2ComputeDForHeadArch22(args, plan.heads[i]);
+    for (int coreHeadId = 0; coreHeadId < plan.activeHvCount; ++coreHeadId) {
+        const CoreHeadBinding current = BindAicCoreHead(plan, coreHeadId);
+        Stage2PrefetchRightToL1NzArch22(args, plan.heads[current.roundHead],
+                                        current.pipelineSlot);
+        if (coreHeadId > 0) {
+            const CoreHeadBinding previous = BindAicCoreHead(plan, coreHeadId - 1);
+            Stage2ComputeDForHeadArch22(args, plan.heads[previous.roundHead],
+                                        previous.pipelineSlot);
+        }
         ++result.activeTaskCount;
+    }
+    if (plan.activeHvCount > 0) {
+        const int lastCoreHeadId = plan.activeHvCount - 1;
+        const CoreHeadBinding last = BindAicCoreHead(plan, lastCoreHeadId);
+        Stage2ComputeDForHeadArch22(args, plan.heads[last.roundHead], last.pipelineSlot);
     }
     result.kgLoadCount = plan.requiredKhCount;
     result.produced = true;

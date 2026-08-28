@@ -69,9 +69,9 @@ dtype 字段而忽略 shape、gate 或 workspace 生命周期。
 `HeadBinding.kgSlot` 都是调度阶段根据 `cu_seqlens/chunk_indices`、`HK/HV` 和 gate mode
 派生出来的结果。它们必须在进入 chunk 循环前确定，但不能反过来写回或伪装成 16 份常驻 kg。
 
-`useExp2` 和 `stateVFirst` 是设计文档要求透传到 kernel 的属性；当前仓库真实 op_host
-tiling 仍需在 host 与 kernel 结构中按相同顺序补齐这两个字段。伪代码已按最终设计读取它们，
-不以默认值替代，也不依赖外部 L2 transpose。
+`useExp2` 和 `stateVFirst` 是设计文档要求透传到 kernel 的属性；真实 op_host tiling 与
+kernel 结构已经按相同顺序写入这两个字段。伪代码和落地实现都不得以默认值替代，也不依赖
+外部 L2 transpose。
 
 ## Stage 内部模块
 
@@ -84,13 +84,13 @@ tiling 仍需在 host 与 kernel 结构中按相同顺序补齐这两个字段�
 
 | 模块 | 输入 | 输出 | 主要驻留 | 必须闭合的事件 |
 | --- | --- | --- | --- | --- |
-| `SMinusOneLoadInitial` | `initial_state[n,hv,:,:]`、`state_v_first` | FP32 canonical `[K,V]` | 独立 initial input bank | `InitialInputReady`、上一代 `InitialInputFree` |
-| `SMinusOneConvertAndWriteH0` | FP32 initial bank | BF16 `H_0` | 独立 H0 bank、公开 `h0` 的 GM layout-aware 存储 | VF 末次读取 input 后 `InitialInputFree`；GM MTE3 完成后 `HGmReady`，S0 再转 L1 NZ |
-| `RunSMinusOneArch22` | 当前 round 的 active head mask | 当前 round 全部 H ready | 不占用 main P/D local data bank | 所有 active head 的 `InitialPhaseDrain` 后才能启动 S0 |
+| `SMinusOneLoadInitial` | `initial_state[n,hv,:,:]`、`state_v_first` | FP32 canonical `[K,V]` | 本 AIV 实际 head 对应的 initial input bank | 本 head MTE2 后立即发布 `InitialInputReady[localSlot]` |
+| `SMinusOneConvertAndWriteH0` | FP32 initial bank | BF16 `H_0` | 独立 H0 bank、公开 `h0` 的 GM layout-aware 存储 | VF 等本槽 `InitialInputReady`；本 head GM MTE3 后发布 `HGmReady`，S0 再转 L1 NZ |
+| `RunSMinusOneArch22/35` | 本 AIV 的动态 `coreHeadCount` | 本 AIV 实际 head 的 H ready | 不占用 main P/D local data bank | current MTE2、previous VF/MTE3；无统一 phase token |
 
 S-1 的一次完整 task 顺序固定为：`MTE2(initial GM -> FP32 UB)` -> `MTE2_V ready` ->
-`VF cast FP32 -> BF16` -> `MTE3(h0 GM layout-aware)`。GM MTE3 完成后才释放 H0 bank；`HGmReady`
-在 phase drain 后统一发布，S0 随后用 MTE2 转成 L1 NZ，不能让单个 head 先启动 S0 MTE1。
+`VF cast FP32 -> BF16` -> `MTE3(h0 GM layout-aware)`。每个 `HGmReady` 紧跟本 head 的 MTE3
+发布，S0 随后按 head 用 MTE2 转成 L1 NZ；不要求等待另一个 AIV 或不存在的 pong。
 
 ### Stage0：Cube 计算 `P = W @ H`
 
@@ -100,7 +100,8 @@ S-1 的一次完整 task 顺序固定为：`MTE2(initial GM -> FP32 UB)` -> `MTE
 | `Stage0LoadW` | `w[chunk,hv]` 有效 `M` 行 | `w_c[M,K]` | L1 W slot `[0,64)` | `WFree -> WReady`；尾部先清零再覆盖有效行 |
 | `Stage0ComputeP` | L1 W/H | `Pacc` FP32，再转 `P` | L0A/L0B；UB local data bank 的 P 区 | arch22：`WReady/HReady -> MTE1 -> MMAD -> L0C->GM->MTE2->UB(PReady)`；arch35：`... -> L0C->UB(PReady)`；S1 末次读取后 `PFree` |
 
-S0 的真实顺序是：每个 head 依次完成 H/W MTE2、MTE1、MMAD 和架构对应的结果写回；S0 不读取或搬运
+S0 按当前 AIC 核实际获得的 `coreHeadCount` 做滚动流水。循环先发当前 head 的 H/W MTE2，再让
+MTE1/Cube/Fixpipe 消费前一个 head；L0A/L0B/L0C 使用 `coreHeadId` 选择四个独立 AIC 槽。S0 不读取或搬运
 `kg`。arch22 的 A2/A3 不支持 L0C -> UB，`P` 按 StateT 选择格式写入 P GM scratch，再由 A2 MTE2
 搬回 UB；arch35 的 A5 直接由 Fixpipe 写配对 AIV UB。首 chunk 无 initial 时整个 S0 跳过，不能用
 `W @ 0` 伪造 P。
@@ -109,11 +110,11 @@ S0 的真实顺序是：每个 head 依次完成 H/W MTE2、MTE1、MMAD 和架�
 
 | 模块 | 输入 | 输出 | UB/L1 驻留 | 必须闭合的事件 |
 | --- | --- | --- | --- | --- |
-| `Stage1PrepareInitialOrZeroState` | BF16 initial 或空初态 | `R_0/H_0` | BF16 state UB `[128,192)`；必要时 FP32 zero-H0 固定目标 | `StateReady`；H0 MTE3 只在确有下一 S0 时发布 `UnionFree` |
-| `Stage1LoadUAndGate` | `u[0,M)`、g-only 的 `g[0,M)` | UB `u_c`、gate 临时区 | V_new work bank；gate `[224,225)` | 上代 `VNewWorkFree` 后 acquire；MTE2 -> VF ready |
+| `Stage1PrepareInitialOrZeroState` | BF16 initial 或空初态 | `R_0/H_0` | BF16 state UB `[128,192)`；必要时 FP32 zero-H0 固定目标 | arch22 发布 `StateInitToH0Ready`；arch35 发布 `StateInitToStage1VReady`；H0 MTE3 后用 `StateToVFree` 交给 S3 |
+| `Stage1LoadUAndGate` | `u[0,M)`、g-only 的 `g[0,M)` | UB `u_c`、gate 临时区 | V_new work bank；gate `[224,225)` | 同槽复用先等 `S1Mte3ToMte2Free`；本槽 MTE2 后立即发布 `S1Mte2ToVReady` |
 | `Stage1ComputeAndWriteVNew` | `u_c`、可选 `P_c`、gate | FP32 `V_new_fp32`、BF16 `V_new`、可选 `V_new_g/alpha` | `V_new` work bank；g-only 独立 `V_new_g` 区；alpha `[225,226)` | `PReady -> VF`；P 末次读取后 `PFree` |
 | `Stage1WriteRightOperandToGm` | g-only `V_new_g` 或 gk-only `V_new`，UB ND | 私有 GM ND right scratch | `rightOperandGm[roundHead]`；每 slot 仅保留当前 chunk | MTE3 完成后 `RightGmReady`；S2 MTE2 读完后 `RightGmFree` |
-| `Stage1ReleaseVNewWork` | V_new UB bank | 释放 work bank | 不写无消费者的 L1 | 所有以 bank 为源的 MTE3 完成后 `VNewWorkFree` |
+| `Stage1ReleaseVNewWork` | V_new UB bank | 释放 work bank | 不写无消费者的 L1 | 仅当同 chunk/下一 chunk 确有同槽 MTE2 时，在最后一条 MTE3 后发布 `S1Mte3ToMte2Free` |
 
 每个 head 只调用一次完整 VF。VF 内先完成 `V_new_fp32 = u - P`，再按分支转 BF16 并写
 公开 `v_new`。g-only 在同一次 VF 内生成 `V_new_g` 和 `alpha`，MTE3 将 ND 输出写入私有
@@ -122,19 +123,25 @@ ND 搬成 L1 NZ，不能走 UB -> L1 直通路径，否则一次搬运会被拆�
 `output_final_state=false` 时选择 `v_new-only`：只搬 `u` 和必要的 `P`，不搬 gate、不生成
 `V_new_g/alpha`、不写 L1 右操作数。
 
+每个 AIV 先将 round head 映射成自己的连续 `coreHeadId`，再执行同一套滚动循环。例如四个
+round head 时，AIV0 的 `roundHead 0/2 -> coreHeadId 0/1`，AIV1 的
+`roundHead 1/3 -> coreHeadId 0/1`。实际 `coreHeadCount` 由本轮有效 head 数决定，不能假设
+两个本地槽都存在；AIV 槽直接取本核 `coreHeadId=0/1`。
+
 ### Stage2：Cube 计算 `D`
 
 | 模块 | 输入 | 输出 | L1/UB 驻留 | 必须闭合的事件 |
 | --- | --- | --- | --- | --- |
 | `Stage2LoadKgForRound` | 当前 `requiredKh[]` 的 `(chunk, kh)` | 当前 round 的 `kg`/`k_raw` payload | L1 kg slot `[256,320)` 的 `Nkg_round` 个 slot | 等上一代 `kg_overwrite_safe` 后 acquire；MTE2 发起后交给首个消费者等待 |
 | `Stage2EnsureKgReady` | 当前 `kg_binding` | valid `kg[M,K]` | L1 kg slot `[256,320)` | 等待本 Stage2 MTE2 完成并发布 `kg_ready`；后续 mapped head 直接复用 |
-| `Stage2PrefetchRightToL1Nz` | 私有 GM ND right scratch | 异步发起 L1 NZ 右操作数搬运 | 对应 H slot `[128,256)`；Stage2 才 acquire | `RightGmReady -> MTE2` |
+| `Stage2PrefetchRightToL1Nz` | 私有 GM ND right scratch | 异步发起 L1 NZ 右操作数搬运 | 对应 H slot `[128,256)`；Stage2 才 acquire | 当前 S0 存在时先等 `HFree`，再由 `RightGmReady -> MTE2` |
 | `Stage2EnsureRightL1Ready` | 已发起的 GM ND -> L1 NZ 搬运 | L1 NZ 右操作数就绪 | 对应 H slot `[128,256)` | MTE2 完成后 `RightL1Ready`、`RightGmFree` |
 | `Stage2WaitRightL1AndAcquireD` | L1 NZ 右操作数、P/D local data owner | D owner | UB local data bank `[0,128)` | `RightL1Ready` 和前一 owner `PFree/DFree` |
 | `Stage2ComputeDForHead` | g-only `k_raw + V_new_g` 或 gk-only `kg + V_new` | FP32 `D` | L0A/L0B；arch22 经 GM scratch 回到 UB，arch35 由 Fixpipe 到 UB D 区 `[0,128)` | 首个 mapped head 等 `kg_ready`；arch22：`MMAD -> L0C->GM->MTE2->UB`，arch35：`MMAD -> L0C->UB`，随后 `DReady` |
 | `Stage2ReleaseInputs` | 本次 MTE1 读取完成 | 释放 right/kg | L1 right 与 kg slot | right 最后消费者 `RightFree`；kg 最后消费者 `kg_overwrite_safe` |
 
-Stage2 进入时先为当前 round 的每个 distinct `kh` 发起一次 MTE2；同一个 `kh` 的多个 value
+Stage2 进入时先为当前 round 的每个 distinct `kh` 发起一次 MTE2，并在每个 kg slot 自己的
+MTE2 批次后立即发布 `kg_ready`，不能等全部 kg 搬运结束后统一发布。同一个 `kh` 的多个 value
 head 共享一份 L1 kg payload，但每个 head 仍以自己的右操作数执行一次 MMAD。`kg_ready`
 只由第一个 mapped head 等待一次，后续 head 直接复用 valid entry；最后一个 mapped head 的
 MTE1 完成后才释放该 kg slot。S2 的 D 始终 `NoQuant` 写 FP32 UB，不作为 Stage2 的公开输出；
@@ -145,9 +152,9 @@ UB -> NZ L1 的直通右操作数路径。
 
 | 模块 | 输入 | 输出 | UB/L1 驻留 | 必须闭合的事件 |
 | --- | --- | --- | --- | --- |
-| `Stage3PrepareState` | BF16 UB resident 或 FP32 rolling GM | 当前 `R_c` | BF16 `[128,192)`；FP32 shared scratch `[160,224)` | 前代 state MTE3 等待 `StateToVFree/StateToMte2Free`；FP32 MTE2 后 `StateReady` |
+| `Stage3PrepareState` | BF16 UB resident 或 FP32 rolling GM | 当前 `R_c` | BF16 `[128,192)`；FP32 shared scratch `[160,224)` | 前代 state MTE3 等待 `StateToVFree/StateToMte2Free`；FP32 MTE2 后 `StateMte2ToStage3VReady` |
 | `Stage3LoadGate` | g-only alpha 或 gk 最后有效行 `gk[M-1,:]` | VF gate 输入 | alpha `[225,226)` 或 gk_last `[224,225)` | gk MTE2 -> VF ready；尾 chunk 使用 `M-1` |
-| `Stage3ComputeRNext` | `D_c`、`R_c`、gate | `Rnext`、BF16 `Hnext` | D local data；state scratch/resident | `DReady/StateReady -> 一次完整 VF` |
+| `Stage3ComputeRNext` | `D_c`、`R_c`、gate | `Rnext`、BF16 `Hnext` | D local data；state scratch/resident | `DReady`、实际存在的 gate/state ready -> 一次完整 VF |
 | `Stage3WriteStateOutputs` | canonical `Rnext/Hnext` | 非末 chunk 的 GM layout-aware `h`，末 chunk 的 `final_state` | H 的 GM 输出；下一 S0 再搬到 L1 NZ | H GM MTE3 完成后 `HGmReady`；无后继不发无消费者 token |
 | `Stage3ReleaseStateAndD` | D 最后读取、state 最后输出 | 释放 D/state/gate | owner 迁移为 Free 或下一代 owner | `DFree`；state 按下一实际消费者发布对应 free |
 
@@ -156,6 +163,10 @@ Vector 算术在 FP32 寄存器中完成，再按 StateT 量化。BF16 state 原
 state 只在 VF 期间占用 shared scratch，需跨 chunk 时通过 rolling GM 保存。FP32 分支在同一
 次 VF 中逐行读取 D，某行最后一次读取完成后才把该行固定低 32 KiB 子区交给 BF16 H 写者，
 不做 UB 搬移。
+
+FP32 state 只有一个 shared scratch，不能为了形式上的 ping/pong 在前一个 VF 消费前覆写。
+因此 Stage3 可以先发下一 head 独立 gate 的 MTE2，但 FP32 state 的 acquire/MTE2 仍由
+`StateToMte2Free` 串行保护；BF16 state 按 head 独立驻留，可以完整参与两槽流水。
 
 ### A5 RegBase VF 约束
 
@@ -199,17 +210,74 @@ RegBase VF 的编译约束：
 
 | 生产者 -> 消费者 | 数据 | 事件/动作 | 复用条件 |
 | --- | --- | --- | --- |
-| S0 MTE2 -> S0 MTE1 | W/H | `WReady`、`HReady` | MTE1 完成后分别释放 `WFree`、`HFree` |
-| S0 MTE1 -> S0 Cube/Fixpipe | W/H 到 L0 | MTE1-to-Cube 依赖 | Fixpipe 写 P 前不读取 P |
+| S0 MTE2 -> S0 MTE1 | W/H | `S0Mte2ToMte1Ready[slot]`、`WReady/HReady` | MTE1 完成后分别释放 `WFree/HFree` |
+| S0 MTE1 -> Cube -> Fixpipe | L0A/L0B/L0C | `S0Mte1ToCubeReady[slot]`、`S0CubeToFixpipeReady[slot]` | Cube 末读 L0A/B 后发布 `S0CubeToMte1Free[slot]`；Fixpipe 末读 L0C 后发布 `S0FixpipeToCubeFree[slot]` |
 | S0 结果写回 -> S1 VF | P | arch22：`PgmFree` 后发布 `PReady`；arch35：Fixpipe 后发布 `PReady` | S1 VF 最后一次读 P 后 `PFree` |
 | 首块 H0 MTE3 -> 本 chunk S2 | FP32 无 initial 的 H0 交接 | `LocalDataFree` | S2 获取同一 local data bank 前等待 |
-| S1 MTE2 -> S1 VF | U/g/gk_last | MTE2-to-VF 事件 | VF 完成前不得复用 gate/work bank |
+| S1 MTE2 -> VF -> MTE3 | U/g、V_new/right/H0 | `S1Mte2ToVReady[slot]`、`S1VToMte3Ready[slot]` | 本槽最后一条 MTE3 后发布 `S1Mte3ToMte2Free[slot]` |
 | S1 MTE3 -> S2 MTE2 | V_new_g/V_new 的 GM ND scratch | `RightGmReady` | S2 MTE2 读完后 `RightGmFree`，允许下一 chunk/round 复用 |
-| S2 MTE2 -> S2 MTE1 | L1 NZ right | `RightL1Ready` | S2 最后一次 MTE1 后 `RightFree` |
+| S2 MTE2 -> MTE1 -> Cube -> Fixpipe | L1 NZ right、L0A/B/C | `S2Mte2ToMte1Ready[slot]`、`S2Mte1ToCubeReady[slot]`、`S2CubeToFixpipeReady[slot]` | Cube 末读 L0A/B 后 `S2CubeToMte1Free[slot]`；Fixpipe 末读 L0C 后 `S2FixpipeToCubeFree[slot]`；right 最后一次 MTE1 后 `RightFree` |
 | S2 MTE2 -> S2 首个 MTE1 | kg | `kg_ready`，每 slot 每代一次 | 最后一个 mapped head 后 `kg_overwrite_safe` |
 | S2 结果写回 -> S3 VF | D | arch22：`DgmFree` 后发布 `DReady`；arch35：Fixpipe 后发布 `DReady` | S3 最后一次读 D 后 `DFree` |
+| S3 MTE2 -> VF -> MTE3 | gk_last、R_next/H_next | gk-only 用 `S3Mte2ToVReady[slot]`；所有分支用 `S3VToMte3Ready[slot]` | gk_last 末读后用 `S3VToMte2Free[slot]` 解锁下一代 gate MTE2；state 复用单独使用 state free 事件 |
 | S-1/S3 MTE3 -> S0 MTE2 | H 的 GM layout-aware 存储 | `HGmReady` | S0 MTE2 转成 L1 NZ 后发布 `HReady` |
 | S3 MTE3 -> 后继消费者 | state | `StateToVFree` 或 `StateToMte2Free` | 仅发布有真实消费者的 token |
+
+### 核内动态 AIC 四槽 / AIV 双槽流水
+
+一个 AIC 配对两个 AIV。每个 head-round 最多有四个 value head，因此 AIC 固定提供四个物理槽，
+`aicSlot = coreHeadId`，有效范围为 `0..activeHvCount-1`；同一 round 的四个 head 不在 AIC 内
+复用槽。每个 AIV 最多接收两个 head，因此各自固定提供两个本地槽，`aivSlot = coreHeadId`，
+有效范围为 `0..AivCoreHeadCount-1`。head 数仍然动态，未映射到 head 的物理槽不下发指令，也不
+等待或发布事件。
+
+| 本轮有效 head 数 | AIC 槽 | AIV0 的 `roundHead -> 本地槽` | AIV1 的 `roundHead -> 本地槽` |
+| --- | --- | --- | --- |
+| 1 | `0` | `0 -> 0` | 无 |
+| 2 | `0,1` | `0 -> 0` | `1 -> 0` |
+| 3 | `0,1,2` | `0 -> 0, 2 -> 1` | `1 -> 0` |
+| 4 | `0,1,2,3` | `0 -> 0, 2 -> 1` | `1 -> 0, 3 -> 1` |
+
+AIC 四槽的统一下发流程如下。循环仍然用当前 head 的 MTE2 覆盖前一个 head 的
+MTE1/Cube/Fixpipe 延迟，但槽号不做奇偶折叠：
+
+```text
+for (coreHeadId = 0; coreHeadId < activeHvCount; ++coreHeadId) {
+    current = BindAicCoreHead(coreHeadId)
+    aicSlot = coreHeadId                       # 0/1/2/3，各 head 独占
+
+    PrefetchHOrRightAndWByMte2(current, aicSlot)
+    SetFlag<MTE2_MTE1>(loadToMte1Ready[aicSlot])
+                                                  # 紧跟当前槽最后一条 MTE2
+
+    if (coreHeadId > 0) {
+        previous = BindAicCoreHead(coreHeadId - 1)
+        WaitFlag<MTE2_MTE1>(loadToMte1Ready[previous.pipelineSlot])
+        Mte1CubeFixpipe(previous, previous.pipelineSlot)
+    }
+}
+DrainLastAicHead()
+```
+
+AIC 槽的反向事件只保护真实的跨 Stage 或跨 chunk 复用：当前 chunk 的 S0 在 MMAD/Fixpipe
+完成后分别发布 `S0CubeToMte1Free[i]` 和 `S0FixpipeToCubeFree[i]`，供同一 chunk 的 S2 槽 `i`
+使用；S2 仅在存在下一 chunk 时发布 `S2CubeToMte1Free[i]` 和
+`S2FixpipeToCubeFree[i]`，供下一 chunk 的 S0 槽 `i` 使用。同一个 head-round 内不存在
+`head2` 覆盖 `head0` AIC 槽的等待关系。
+
+每个 AIV 使用同一套循环，但本核 `coreHeadCount` 只能是 `0/1/2`，本地槽分别为 `0/1`。
+当前 head 的 MTE2 后立即发布本槽 ready，再计算前一个本地 head；最后显式 drain。AIV 的
+`S1Mte3ToMte2Free`、`S3VToMte2Free` 等反向事件只在下一 chunk 确实复用同一地址时发布和等待。
+
+SetFlag 只进入 producer pipe，不在 producer 侧立刻 Wait。严禁先连续下发多个槽的 MTE2，
+再统一发布各槽 ready；否则前一个槽的同步点会包含后续槽的无关搬运。ready 必须由 producer
+紧跟本槽最后一条搬运发布。Cube 的 MTE1->Cube、Cube->Fixpipe，以及 Vec 的 VF->MTE3 都遵守
+同一槽级协议。同一时刻仍存活的每条 pipe 边、每个物理槽使用独立 EventID；跨 Stage 或跨
+chunk 复用 EventID 前，必须完成上一代 Set/Wait 闭环并释放事件资源。
+
+Cube 中 L0A/B 的反向边是 `Cube->MTE1`，L0C 的反向边是 `Fixpipe->Cube`；Stage1 原位 work
+buffer 是 `MTE3->MTE2`；Stage3 的 gk_last 槽是 `V->MTE2`。禁止为方便而把这些边统一扩大成
+`Fixpipe->MTE1` 或 `MTE3->MTE2`。
 
 ### 跨 chunk
 
@@ -217,7 +285,7 @@ RegBase VF 的编译约束：
 chunk c:
     S3(h_{c+1} -> GM layout-aware) --HGmReady--> chunk c+1 S0(MTE2 -> L1 NZ) --HReady--> S0(MTE1)
     S3 state MTE3 --StateToVFree--> chunk c+1 S3(VF)
-    S1 V_new MTE3 --VNewWorkFree--> chunk c+1 S1(MTE2)
+    S1 V_new MTE3 --S1Mte3ToMte2Free[slot]--> chunk c+1 S1(MTE2)
     S2 D 最后读取 --DFree--> chunk c+1 S0/S2 复用 local data bank
 ```
 
@@ -231,8 +299,8 @@ chunk `c+1` 不能因为 `RunFwdH` 的函数调用已经返回就假设这些异
 round r 最后一个 chunk 完成：
     若存在 S2：等待每个有效 kg slot 的 kg_overwrite_safe
     若存在 S0：等待每个 W/H slot 的 WFree/HFree，并等待 local data 的 PFree/DFree
-    若存在后继 head round：等待 VNewWorkFree 和 state 的下一 owner free
-    等待 round r 的 TerminalDrain
+    若存在后继 head round：等待 state 的下一 owner free，并执行本 AIV 的 VectorRoundDrain
+    AIC 等待本核 `CubeRoundDrain`，每个 AIV 只等待本核 `VectorRoundDrain`
     将已经等待完成的 state owner 显式归还 FREE；round r+1 首块标记 roundBoundaryDrained，
     不再对同一个 free token 二次 Wait
     才允许 round r+1 执行 S-1、S0 的 H/W 搬运和 Stage2 的 kg 搬运
@@ -242,6 +310,10 @@ round r 最后一个 chunk 完成：
 并重新读取新的 `(chunk,kh)` payload。`UnionFree` 仅用于下一真实写者是 AIC S0 的特殊
 `v_new-only` 路径；下一 round 无 initial 时由同一 AIV 的 V pipe 顺序接管，不生成跨核
 无消费者 token。
+
+sequence 边界使用同一协议：sequence `n+1` 的 round 0 把 sequence `n` 的最后一个
+head_round 作为 previous work-round。最后一个 sequence 的最后一个 round 没有后继消费者，
+直接执行 kernel-exit drain，不发布 `CubeRoundDrain/VectorRoundDrain`。
 
 ## 固定 UB/L1 地址合同
 
@@ -261,7 +333,8 @@ round r 最后一个 chunk 完成：
 | UB alpha | `[225,226)` | 空闲 | g-only `alpha` | 保留 | 读取后释放 |
 
 `L1[128,256)` 在每个 Stage 只记录当前 owner：S0 是 H，S1 不占用，S2 是 GM ND 转换后的右操作数，
-S3 是 Hnext；前一 owner 的最后一次 MTE1/MTE3 完成并发布 free 后，下一 owner 才能写入。
+S3 的 Hnext 只写 GM、不直接写 L1。S2 right MTE2 等当前 S0 的 `HFree`；下一 chunk S0 H MTE2
+等上一 S2 的 `RightFree`，前一 owner 的最后一次 MTE1 完成后下一 owner 才能覆盖。
 GM scratch 只保存当前 chunk 的 ND 右操作数，S2 MTE2 完成后通过 `RightGmFree` 归还，
 下一 chunk/round 才能覆盖。`L1[256,320)`
 的未使用 slot 始终为 `FREE`，不因数组上限而预先写入 16 份 key。
@@ -273,39 +346,17 @@ GM scratch 只保存当前 chunk 的 ND 右操作数，S2 MTE2 完成后通过 `
     plan = BuildChunkPlan(headRoundPlan, tiling, sequence, chunk)
 
     如果 plan.stage0Required：
-        对每个 active head：
-            S0.LoadH()                         # BF16 initial 本地 MTE2；其余等待 HGmReady 后再转 L1 NZ
-            S0.LoadW()                         # 清零 tail 后搬入 M 个有效行
-            S0.MTE1(W,H) -> MMAD -> arch22: L0C->GM->MTE2->UB(P)
-                                      arch35: L0C->UB(P)
-            发布 PReady；释放 W/H；保留 P 到 S1 末次读取
+        RunStage0AicFourSlot(coreHeadCount)     # 动态 1..4；四个 AIC 槽不在本 round 内复用
 
-    对每个 active head：
-        S1.LoadUAndGate()                      # 等上代 VNewWorkFree
-        等待 PReady（无 P 的首 chunk 不等待）
-        VF: V_new_fp32 = U - P；转 BF16 并写 v_new GM
-        如果 g-only 且存在 S2：同一次 VF 生成 V_new_g/alpha，MTE3 写 GM ND，发布 RightGmReady
-        如果 gk-only 且存在 S2：MTE3 写 V_new 到 GM ND，发布 RightGmReady
-        P 末次读和所有相关 MTE3 完成后发布 PFree/VNewWorkFree
+    每个 AIV：
+        RunStage1AivTwoSlot(coreHeadCount)      # 动态 0..2；current MTE2 与 previous VF/MTE3 重叠
 
     如果 plan.stage2Required：
         S2.LoadKgForRound(requiredKh[])         # 仅在 S2 入口搬运当前 chunk 的 distinct kg
-        对每个 active head：异步发起 GM ND -> L1 NZ 的 right 预取
-        对每个 active head：
-            确保其 kg slot valid；首个 mapped head 等待本 Stage2 的 MTE2
-            确认预取的 GM ND -> L1 NZ 已完成，发布 RightL1Ready/RightGmFree
-            等待 RightL1Ready 和 local data free
-            MTE1(kg,right) -> MMAD -> arch22: L0C->GM->MTE2->UB(D)
-                                      arch35: L0C->UB(D)
-            发布 DReady；最后一个 mapped head 释放 kg_overwrite_safe
+        RunStage2AicFourSlot(coreHeadCount)     # current right MTE2 与 previous Cube/Fixpipe 重叠
 
-        对每个 active head：
-            等待 DReady；准备 BF16 resident 或 FP32 rolling state
-            g-only 读取 alpha，gk-only 读取最后有效行 gk[M-1,:]
-            一次 VF 完成 Rnext/gate/add；D 末次读后才交出 D 地址
-            非末 chunk：MTE3 写 h GM layout-aware，发布 HGmReady；下一 chunk S0 MTE2 转成 L1 NZ 后发布 HReady
-            最终 chunk 且 output_final_state：MTE3 写 final_state
-            按下一实际 owner 发布 state free；释放 D/gate
+        每个 AIV：
+            RunStage3AivTwoSlot(coreHeadCount)  # gate MTE2、VF、MTE3 按槽流水；FP32 state 单独串行保护
 ```
 
 ## 精确的 round 绑定
