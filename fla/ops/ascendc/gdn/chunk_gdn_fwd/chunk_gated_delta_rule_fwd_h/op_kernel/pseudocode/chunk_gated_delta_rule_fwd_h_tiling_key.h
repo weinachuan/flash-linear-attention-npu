@@ -72,6 +72,14 @@ struct WorkspaceRefs {
     // 右操作数的私有 GM scratch。Stage1 写入 ND，Stage2 再搬成 L1 NZ；
     // 每个 head_round slot 只保存当前 chunk，GM 搬入 L1 后立即归还。
     TensorRef rightOperandGm;
+    // 以下 offset 由 kernel tiling 直接给出，所有地址都相对 GetUserWorkspace(workspace)。
+    const void* userWorkspace = nullptr;
+    int64_t vWorkspaceOffset = 0;
+    int64_t vUpdateWorkspaceOffset = 0;
+    int64_t kDecayWorkspaceOffset = 0;
+    int64_t hWorkspaceOffset = 0;
+    int64_t numSeqWorkspaceOffset = 0;
+    int64_t numChunksWorkspaceOffset = 0;
 };
 
 struct SequenceSpan {
@@ -155,6 +163,8 @@ struct RoundPlan {
 
 struct TilingPlan {
     int64_t batch = 0;
+    int64_t shapeBatch = 0; // dense 为真实 B；varlen 固定为 1
+    int64_t tokenBatch = 0; // dense 为 1；varlen 为 sequence 数
     int64_t sequenceCount = 0;
     int64_t seqlen = 0;
     int64_t hk = 0;
@@ -168,9 +178,53 @@ struct TilingPlan {
     bool varlen = false;
     bool outputFinalState = false;
     bool useInitialState = false;
+    bool useG = false;
+    bool useGk = false;
     bool useExp2 = false;
+    bool stateVFirst = false;
     int totalChunks = 0;
     std::array<SequenceSpan, 64> sequences{};
+};
+
+// 设备入口从 tiling GM 地址读取的原始数据。字段顺序必须与 op_host 的
+// BEGIN_TILING_DATA_DEF(ChunkGatedDeltaRuleFwdHTilingData) 完全一致。
+//
+// batch/seqlen/head/dim/chunkSize：形状和分块参数；
+// useInitialState/storeFinalState：S-1、S0、S3 的首尾分支；
+// dataType/gDataType/stateDataType：入口模板分发，不能在 VF 内运行期判断；
+// isVariedLen/shapeBatch/tokenBatch：dense/varlen 的 sequence 解释；
+// useG/useGk：g-only 或 gk-only，以及 required_hk_round 的映射模式；
+// useExp2/stateVFirst：设计文档要求透传到 kernel 的属性；
+// 六个 workspace offset：GM workspace 子区的起始字节偏移。
+//
+// 当前仓库的真实 op_host tiling 还没有同时写入 useExp2/stateVFirst；落地时必须在
+// host/kernel 两侧以相同顺序补齐，不能在 kernel 中猜默认值或依赖外部转置。
+struct KernelTilingData {
+    int64_t batch = 0;
+    int64_t seqlen = 0;
+    int64_t kNumHead = 0;
+    int64_t vNumHead = 0;
+    int64_t kHeadDim = 0;
+    int64_t vHeadDim = 0;
+    int64_t chunkSize = kBatchTokens;
+    bool useInitialState = false;
+    bool storeFinalState = false;
+    int64_t dataType = 1;
+    int64_t gDataType = 1;
+    int64_t stateDataType = 2;
+    int64_t isVariedLen = 0;
+    int64_t shapeBatch = 0;
+    int64_t tokenBatch = 0;
+    bool useG = false;
+    bool useGk = false;
+    bool useExp2 = false;
+    bool stateVFirst = false;
+    int64_t vWorkspaceOffset = 0;
+    int64_t vUpdateWorkspaceOffset = 0;
+    int64_t kDecayWorkspaceOffset = 0;
+    int64_t hWorkspaceOffset = 0;
+    int64_t numSeqWorkspaceOffset = 0;
+    int64_t numChunksWorkspaceOffset = 0;
 };
 
 struct HostResult {

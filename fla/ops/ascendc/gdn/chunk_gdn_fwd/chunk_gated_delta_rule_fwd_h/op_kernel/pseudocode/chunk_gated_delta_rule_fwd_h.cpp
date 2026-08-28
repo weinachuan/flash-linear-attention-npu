@@ -155,24 +155,65 @@ inline void BindTensor(TensorRef& tensor, GM_ADDR address)
     tensor.present = address != nullptr;
 }
 
-inline TilingPlan DecodeKernelTiling(GM_ADDR tiling)
+inline const KernelTilingData* GetKernelTilingData(GM_ADDR tiling)
 {
-    // 实现时按 ChunkGatedDeltaRuleFwdHTilingData 的字段顺序从 GM tiling 解码；不重新推导 shape。
-    (void)tiling;
-    return {};
+    // tiling 是 host 写入的连续 GM 数据；字段顺序由 KernelTilingData 与 host 宏共同约束。
+    return reinterpret_cast<const KernelTilingData*>(tiling);
 }
 
-inline WorkspaceRefs BindKernelWorkspace(GM_ADDR user, const TilingPlan& plan)
+inline TilingPlan DecodeKernelTiling(const KernelTilingData& data)
 {
-    // user 指向 AscendC::GetUserWorkspace(workspace)；各 scratch 偏移由 op_host tiling 给出。
-    (void)user;
-    (void)plan;
-    return {};
+    // 只把 kernel tiling 中已有的字段搬入计划，不重新推导 head 映射或伪造 shape。
+    TilingPlan plan{};
+    plan.batch = data.batch;
+    plan.shapeBatch = data.shapeBatch;
+    plan.tokenBatch = data.tokenBatch;
+    plan.seqlen = data.seqlen;
+    plan.hk = data.kNumHead;
+    plan.hv = data.vNumHead;
+    plan.keyDim = data.kHeadDim;
+    plan.valueDim = data.vHeadDim;
+    plan.chunkSize = data.chunkSize;
+    plan.useInitialState = data.useInitialState;
+    plan.outputFinalState = data.storeFinalState;
+    plan.varlen = data.isVariedLen != 0;
+    plan.useG = data.useG;
+    plan.useGk = data.useGk;
+    plan.gateMode = data.useGk ? GateMode::KeyWiseGk : GateMode::ScalarG;
+    plan.stateType = data.stateDataType == 2 ? StateType::Fp32 : StateType::Bf16;
+    plan.useExp2 = data.useExp2;
+    plan.stateVFirst = data.stateVFirst;
+    plan.stateLayout = data.stateVFirst ? StateLayout::VK : StateLayout::KV;
+
+    // dense 的 sequence 数可由 shapeBatch 直接得到；varlen 的每个 sequence/chunk
+    // 仍需由 cu_seqlens/chunk_indices 填充，不能把 tokenBatch 当成 chunk 数。
+    plan.sequenceCount = plan.varlen ? data.tokenBatch : data.shapeBatch;
+    if (!plan.varlen && plan.chunkSize > 0) {
+        const int64_t chunksPerSequence =
+            (plan.seqlen + plan.chunkSize - 1) / plan.chunkSize;
+        plan.totalChunks = static_cast<int>(plan.sequenceCount * chunksPerSequence);
+    }
+    return plan;
+}
+
+inline WorkspaceRefs BindKernelWorkspace(GM_ADDR user, const KernelTilingData& data)
+{
+    WorkspaceRefs workspace{};
+    workspace.userWorkspace = user;
+    // 这些 offset 只描述 GM workspace 子区的起点；每个 Stage 再按当前
+    // sequence/chunk/head_round 计算 slot 内偏移，不能把整个 workspace 当单一 tensor。
+    workspace.vWorkspaceOffset = data.vWorkspaceOffset;
+    workspace.vUpdateWorkspaceOffset = data.vUpdateWorkspaceOffset;
+    workspace.kDecayWorkspaceOffset = data.kDecayWorkspaceOffset;
+    workspace.hWorkspaceOffset = data.hWorkspaceOffset;
+    workspace.numSeqWorkspaceOffset = data.numSeqWorkspaceOffset;
+    workspace.numChunksWorkspaceOffset = data.numChunksWorkspaceOffset;
+    return workspace;
 }
 
 inline void BindKernelContext(SchedulerContext& ctx, GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_ADDR gk,
-                              GM_ADDR initialState, GM_ADDR h, GM_ADDR vNew, GM_ADDR finalState,
-                              GM_ADDR user, GM_ADDR tiling)
+                              GM_ADDR initialState, GM_ADDR cuSeqlens, GM_ADDR chunkIndices,
+                              GM_ADDR h, GM_ADDR vNew, GM_ADDR finalState, GM_ADDR user, GM_ADDR tiling)
 {
     ctx = SchedulerContext{};
     BindTensor(ctx.inputs.k, k);
@@ -184,24 +225,18 @@ inline void BindKernelContext(SchedulerContext& ctx, GM_ADDR k, GM_ADDR w, GM_AD
     BindTensor(ctx.outputs.h, h);
     BindTensor(ctx.outputs.v_new, vNew);
     BindTensor(ctx.outputs.finalState, finalState);
-    ctx.tiling = DecodeKernelTiling(tiling);
-    ctx.workspace = BindKernelWorkspace(user, ctx.tiling);
+    const auto* data = GetKernelTilingData(tiling);
+    ctx.tiling = DecodeKernelTiling(*data);
+    ctx.inputs.cuSeqlens = reinterpret_cast<const int64_t*>(cuSeqlens);
+    ctx.inputs.chunkIndices = reinterpret_cast<const int64_t*>(chunkIndices);
+    ctx.inputs.cuSeqlensLength = ctx.tiling.varlen ? data->tokenBatch + 1 : 0;
+    ctx.workspace = BindKernelWorkspace(user, *data);
 }
 
-struct KernelDispatchTiling {
-    int64_t dataType = 1;      // 0: FP16，1: BF16
-    int64_t gDataType = 1;     // 1: BF16，2: FP32
-    int64_t stateDataType = 1; // 1: BF16，2: FP32
-    bool useGk = false;
-    bool useExp2 = false;
-};
-
-inline KernelDispatchTiling ReadKernelDispatchTiling(GM_ADDR tiling)
+inline const KernelTilingData& ReadKernelDispatchTiling(GM_ADDR tiling)
 {
-    // 这里按 op_host 的 ChunkGatedDeltaRuleFwdHTilingData 读取运行期 dispatch 字段；
-    // 所有运行期分支均发生在 VF 之外，VF 本身只接收编译期模板参数。
-    (void)tiling;
-    return {};
+    // 运行期 dispatch 只读取 tiling 的 dtype/gate/exp 字段；VF 内不读取这些布尔值。
+    return *GetKernelTilingData(tiling);
 }
 
 } // namespace fwd_h_pseudocode
@@ -262,12 +297,11 @@ public:
     __aicore__ inline void Init(GM_ADDR k, GM_ADDR w, GM_ADDR h, GM_ADDR cuSeqlens,
                                 GM_ADDR chunkIndices, GM_ADDR user, GM_ADDR tiling)
     {
-        BindKernelContext(ctx_, k, w, nullptr, nullptr, nullptr, nullptr, h, nullptr, nullptr, user, tiling);
+        BindKernelContext(ctx_, k, w, nullptr, nullptr, nullptr, nullptr, cuSeqlens, chunkIndices,
+                          h, nullptr, nullptr, user, tiling);
         ctx_.tiling.valueDim = TileShapes::valueDim;
         ctx_.tiling.gateMode = kGateMode == kGateG ? fwd_h_pseudocode::GateMode::ScalarG
                                                    : fwd_h_pseudocode::GateMode::KeyWiseGk;
-        (void)cuSeqlens;
-        (void)chunkIndices;
     }
 
     __aicore__ inline void Process()
@@ -288,13 +322,12 @@ public:
                                 GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR h, GM_ADDR vNew,
                                 GM_ADDR finalState, GM_ADDR user, GM_ADDR tiling)
     {
-        BindKernelContext(ctx_, nullptr, nullptr, u, g, gk, initialState, h, vNew, finalState, user, tiling);
+        BindKernelContext(ctx_, nullptr, nullptr, u, g, gk, initialState, cuSeqlens, chunkIndices,
+                          h, vNew, finalState, user, tiling);
         ctx_.tiling.valueDim = TileShapes::valueDim;
         ctx_.tiling.gateMode = kGateMode == kGateG ? fwd_h_pseudocode::GateMode::ScalarG
                                                    : fwd_h_pseudocode::GateMode::KeyWiseGk;
         ctx_.tiling.useExp2 = ExpMode != kExpModeNatural;
-        (void)cuSeqlens;
-        (void)chunkIndices;
     }
 
     __aicore__ inline void Process()
@@ -402,6 +435,13 @@ __aicore__ inline void ChunkGatedDeltaRuleFwdHDispatch(
     GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR h, GM_ADDR vNew, GM_ADDR finalState,
     GM_ADDR tiling, GM_ADDR user)
 {
+    // 本入口消费的 tiling 数据分为四组：
+    // 1) batch/seqlen/kNumHead/vNumHead/kHeadDim/vHeadDim/chunkSize -> sequence、chunk、head_round 计划；
+    // 2) useInitialState/storeFinalState/stateVFirst -> S-1、S0、S3 以及 state GM 物理布局；
+    // 3) dataType/gDataType/stateDataType/useG/useGk/useExp2 -> 编译期 InputT/GateT/StateT/ExpMode 分发；
+    // 4) 六个 workspace offset -> 各 GM scratch 子区的基址，Stage 内再按 slot 计算地址。
+    // shapeBatch/tokenBatch/isVariedLen 只说明 dense/varlen 的序列解释；具体 chunk span
+    // 仍由 cuSeqlens/chunkIndices 建立，不能从单个 tokenBatch 猜出每个序列长度。
     const auto deviceTiling = ReadKernelDispatchTiling(tiling);
     const uint32_t expMode = deviceTiling.useExp2 ? 1 : kExpModeNatural;
     if (deviceTiling.dataType == 1) {

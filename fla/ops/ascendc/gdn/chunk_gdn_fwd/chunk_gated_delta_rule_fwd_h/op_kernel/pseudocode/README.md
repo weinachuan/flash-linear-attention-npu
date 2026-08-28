@@ -33,6 +33,46 @@ op_kernel/
 | `arch35/chunk_gated_delta_rule_fwd_h_vec.h` | A5 独立 Vec 实现；每个阶段一个 RegBase 完整 head VF | initial/u/P/D、门控、state | H0、`V_new`、GM ND right、h、final_state | 不包含 arch22 Vec；MTE2 完成后只进入本文件的单次 VF，MTE3 写 GM ND，S2 再转 L1 NZ |
 | `chunk_gated_delta_rule_fwd_h.cpp` | 设备 kernel 入口、架构选择和 sequence -> round -> chunk 调度 | GM 地址、host 生成的 tiling | `h`、`v_new`、`final_state` | `Init` 只绑定地址；下一 round 必须等上一 round 的 kg/H/W/异步搬运全部排空 |
 
+## KernelTilingData 字段
+
+设备入口从 `tiling` GM 地址读取下面这一个连续结构。字段顺序必须与
+`op_host` 的 `BEGIN_TILING_DATA_DEF(ChunkGatedDeltaRuleFwdHTilingData)` 一致；不能只读取
+dtype 字段而忽略 shape、gate 或 workspace 生命周期。
+
+| 字段 | 含义 | 读取/使用位置 |
+| --- | --- | --- |
+| `batch` | dense 为真实 batch；varlen 为 sequence 数 | `DecodeKernelTiling`，输出和 sequence 基址 |
+| `seqlen` | 输入 token 轴长度；varlen 时为扁平 token 轴长度 | chunk 边界和 token 地址 |
+| `kNumHead` / `vNumHead` | `HK` / `HV` | `BuildHeadRoundPlan`，确定最多四个 `H_v` |
+| `kHeadDim` / `vHeadDim` | `K` / `V` tile 尺寸 | tiling key、H/W/右操作数寻址 |
+| `chunkSize` | 当前设计固定为 64 | `BuildChunkPlan` 的有效行数 `M` |
+| `useInitialState` | 是否有 initial state | S-1、首 chunk 的 S0/S1 分支 |
+| `storeFinalState` | 是否写 final state | 最终 chunk 的 S3 输出分支 |
+| `dataType` | `k/w/u` 的 dtype 枚举：FP16=0、BF16=1、FP32=2 | `DispatchGateType` 的 `InputT` |
+| `gDataType` | `g/gk` 的 dtype 枚举 | `DispatchGateType` 的 `GateT` |
+| `stateDataType` | state 的 dtype 枚举 | `DispatchStateType` 的 `StateT` |
+| `isVariedLen` | 0 为 dense，非 0 为 varlen | `DecodeKernelTiling` 和序列解释 |
+| `shapeBatch` | dense 的 `B`；varlen 固定为 1 | dense sequence 数 |
+| `tokenBatch` | dense 为 1；varlen 为 `cu_seqlens` 推出的 sequence 数 | varlen sequence 数 |
+| `useG` / `useGk` | 标记 g-only 或 gk-only（两者只能一个为真） | gate mode、`H_v -> H_k`/kg 映射 |
+| `useExp2` | `false` 使用 `exp`，`true` 使用 `exp2` | 入口外层 `ExpMode` 模板分发 |
+| `stateVFirst` | false 为 GM `[K,V]`，true 为 GM `[V,K]` | state GM layout-aware 读写；内部仍为 canonical `[K,V]` |
+| `vWorkspaceOffset` | `v` workspace 子区起始字节偏移 | Stage1/Stage2 的 GM 中转分配 |
+| `vUpdateWorkspaceOffset` | `v_update` workspace 子区起始字节偏移 | Stage1 的更新中转 |
+| `kDecayWorkspaceOffset` | gk/k decay workspace 子区起始字节偏移 | gk-only Stage2 kg 准备 |
+| `hWorkspaceOffset` | H workspace 子区起始字节偏移 | H 的跨核/跨阶段 GM 中转 |
+| `numSeqWorkspaceOffset` | sequence 元数据 workspace 偏移 | varlen sequence 元数据 |
+| `numChunksWorkspaceOffset` | chunk 元数据 workspace 偏移 | varlen global chunk 索引 |
+
+`sequenceCount` 不是原始 tiling 字段：dense 取 `shapeBatch`，varlen 取 `tokenBatch`。
+`totalChunks`、每个 `SequenceSpan` 的 `chunkPrefix`、每轮 `requiredKhCount` 以及四个槽位的
+`HeadBinding.kgSlot` 都是调度阶段根据 `cu_seqlens/chunk_indices`、`HK/HV` 和 gate mode
+派生出来的结果。它们必须在进入 chunk 循环前确定，但不能反过来写回或伪装成 16 份常驻 kg。
+
+`useExp2` 和 `stateVFirst` 是设计文档要求透传到 kernel 的属性；当前仓库真实 op_host
+tiling 仍需在 host 与 kernel 结构中按相同顺序补齐这两个字段。伪代码已按最终设计读取它们，
+不以默认值替代，也不依赖外部 L2 transpose。
+
 ## Stage 内部模块
 
 以下每个模块对应一个可替换的 Ascend C 实现单元。模块输入和输出均以一个
