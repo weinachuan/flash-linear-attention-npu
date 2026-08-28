@@ -74,20 +74,6 @@ struct WorkspaceRefs {
     TensorRef rightOperandGm;
 };
 
-// 仅供 fast-launch 形状伪代码入口使用的框架侧名称。
-using PseudocodeTensor = TensorRef;
-using OptionalPseudocodeTensor = TensorRef;
-
-struct OptionalIntArray {
-    const int64_t* data = nullptr;
-    int64_t size = 0;
-};
-
-struct PseudocodeTensorTuple {
-    ApiOutputs outputs{};
-    bool parameterError = false;
-};
-
 struct SequenceSpan {
     int sequence = 0;
     int64_t tokenBegin = 0;

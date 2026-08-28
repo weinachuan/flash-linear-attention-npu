@@ -14,7 +14,7 @@ op_kernel/
 ├── chunk_gated_delta_rule_fwd_h_tiling_key.h # 常量、属性和计划数据结构
 ├── chunk_gated_delta_rule_fwd_h_policy.h    # 槽位、所有权和事件策略
 ├── chunk_gated_delta_rule_fwd_h_utils.h     # 校验、寻址、GVA 映射和 round 计划
-└── chunk_gated_delta_rule_fwd_h.cpp         # fast-launch 形状入口和总调度
+└── chunk_gated_delta_rule_fwd_h.cpp         # 真实 kernel 入口和总调度
 ```
 
 设计文档 `gdn-fwd-h-ascendc-design.md` 是唯一依据。伪代码严格使用设计中的术语：`kg`
@@ -31,7 +31,7 @@ op_kernel/
 | `arch22/chunk_gated_delta_rule_fwd_h_vec.h` | arch22 的 S-1/Stage1/Stage3 Vec 伪代码 | initial_state、u、P、D、门控 | H0、`V_new`、GM ND right、h、final_state | `V_new`/GM ND right 只保留到各自消费者；无消费者的最终 chunk 不写 right |
 | `arch35/chunk_gated_delta_rule_fwd_h_cube.h` | A5 独立 Cube Stage0/Stage2 实现 | H/W/k、当前 round 计划 | P、D、kg ready/free | A5 自己完成 MTE2/MTE1/MMAD/Fixpipe；支持 L0C -> UB，P/D 不经过 arch22 或 GM |
 | `arch35/chunk_gated_delta_rule_fwd_h_vec.h` | A5 独立 Vec 实现；每个阶段一个 RegBase 完整 head VF | initial/u/P/D、门控、state | H0、`V_new`、GM ND right、h、final_state | 不包含 arch22 Vec；MTE2 完成后只进入本文件的单次 VF，MTE3 写 GM ND，S2 再转 L1 NZ |
-| `chunk_gated_delta_rule_fwd_h.cpp` | Host 适配、架构选择和 sequence -> round -> chunk 调度 | 框架 tensor、属性 | `(h, v_new, final_state)` | 下一 round 必须等上一 round 的 kg/H/W/异步搬运全部排空 |
+| `chunk_gated_delta_rule_fwd_h.cpp` | 设备 kernel 入口、架构选择和 sequence -> round -> chunk 调度 | GM 地址、host 生成的 tiling | `h`、`v_new`、`final_state` | `Init` 只绑定地址；下一 round 必须等上一 round 的 kg/H/W/异步搬运全部排空 |
 
 ## Stage 内部模块
 
