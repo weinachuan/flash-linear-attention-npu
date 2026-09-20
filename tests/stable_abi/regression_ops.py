@@ -1458,6 +1458,28 @@ def scenario_chunk_kda_bwd():
         lambda: _launcher.npu_chunk_kda_bwd(
             q_p, k_p, v_p, beta_p, gk_p, Aqk_p, Akk_p, w_p, qg_p, kg_p,
             v_new_p, h_p, d_o_p, kd, **kw_p))
+    # Packed varlen with gate-in-kernel and dt_bias.  Two further host-layer
+    # defects used to hide the kernel behind each other here: the legacy branch
+    # read dim 3 of the packed [H,T,D] q tensor ("size_of dim out of range"),
+    # and after that was fixed the backward outputs were described with a flat
+    # rank-1 storage shape, which made KdaGateBwdPostVarlen reject the call as
+    # ACLNN_ERR_PARAM_INVALID.  The ctypes reference passes the logical shape as
+    # the storage override for every output, so the adapter now uses
+    # nd_logical_out_tensor for the KDA backward outputs.
+    raw_g_p = packed((Hp, Tp, K), dt)
+    a_log_p = packed((Hp,), torch.float32)
+    dt_bias_p = packed((Hp, K), torch.float32, 1e-2)
+    kw_gate = dict(kw_p, raw_g=raw_g_p, A_log=a_log_p, dt_bias=dt_bias_p,
+                   use_gate_in_kernel=True)
+    torch.npu.synchronize()
+    parity_or_domain_skip(
+        "chunk_kda_bwd(packed varlen gate-in-kernel)",
+        lambda: ct.npu_chunk_kda_bwd(
+            q_p, k_p, v_p, beta_p, gk_p, Aqk_p, Akk_p, w_p, qg_p, kg_p,
+            v_new_p, h_p, d_o_p, kd, **kw_gate),
+        lambda: _launcher.npu_chunk_kda_bwd(
+            q_p, k_p, v_p, beta_p, gk_p, Aqk_p, Akk_p, w_p, qg_p, kg_p,
+            v_new_p, h_p, d_o_p, kd, **kw_gate))
 
 
 def scenario_chunk_kda_bwd_recompute():
