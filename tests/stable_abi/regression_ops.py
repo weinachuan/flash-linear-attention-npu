@@ -1422,6 +1422,45 @@ def scenario_chunk_kda_bwd():
             lambda extra=extra: _launcher.npu_chunk_kda_bwd(
                 q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h, d_o,
                 K ** -0.5, **dict(kw, **extra)))
+    # Packed varlen spelling with gate-in-kernel and dt_bias.  The stable host
+    # layer used to read dim 3 of the packed [H,T,D] q tensor, so every packed
+    # call that also passed dt_bias threw "size_of dim out of range" before the
+    # kernel was reached while the ctypes reference ran normally.  H is even and
+    # both segment lengths are whole chunks so the launch stays a single fused
+    # call instead of the A2 per-sequence or padded-tail rewrites.
+    Hp, Tp = 4, 128
+    NTp = Tp // cs
+
+    def packed(shape, dtype, scale=1.0):
+        return (torch.randn(*shape, dtype=dtype, device="npu") * scale).contiguous()
+
+    q_p = packed((Hp, Tp, K), dt, 5e-2)
+    k_p = packed((Hp, Tp, K), dt, 5e-2)
+    v_p = packed((Hp, Tp, V), dt, 5e-2)
+    beta_p = packed((Hp, Tp), dt)
+    gk_p = packed((Hp, Tp, K), torch.float32)
+    Aqk_p = packed((Hp, Tp, cs), dt, 5e-2)
+    Akk_p = packed((Hp, Tp, cs), dt, 5e-2)
+    w_p = packed((Hp, Tp, K), dt, 5e-2)
+    qg_p = packed((Hp, Tp, K), dt, 5e-2)
+    kg_p = packed((Hp, Tp, K), dt, 5e-2)
+    v_new_p = packed((Hp, Tp, V), dt, 5e-2)
+    h_p = packed((NTp, Hp, K, V), dt, 5e-2)
+    d_o_p = packed((Hp, Tp, V), dt, 5e-2)
+    kd = K ** -0.5
+    kw_p = dict(kw, raw_g=packed((Hp, Tp, K), dt),
+                A_log=packed((Hp,), torch.float32),
+                dt_bias=packed((Hp, K), torch.float32, 1e-2),
+                cu_seqlens=[0, Tp], use_gate_in_kernel=True)
+    torch.npu.synchronize()
+    parity_or_domain_skip(
+        "chunk_kda_bwd(packed varlen gate-in-kernel)",
+        lambda: ct.npu_chunk_kda_bwd(
+            q_p, k_p, v_p, beta_p, gk_p, Aqk_p, Akk_p, w_p, qg_p, kg_p,
+            v_new_p, h_p, d_o_p, kd, **kw_p),
+        lambda: _launcher.npu_chunk_kda_bwd(
+            q_p, k_p, v_p, beta_p, gk_p, Aqk_p, Akk_p, w_p, qg_p, kg_p,
+            v_new_p, h_p, d_o_p, kd, **kw_p))
 
 
 def scenario_chunk_kda_bwd_recompute():
