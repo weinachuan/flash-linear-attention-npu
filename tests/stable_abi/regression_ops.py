@@ -1422,12 +1422,12 @@ def scenario_chunk_kda_bwd():
             lambda extra=extra: _launcher.npu_chunk_kda_bwd(
                 q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h, d_o,
                 K ** -0.5, **dict(kw, **extra)))
-    # Packed varlen spelling with gate-in-kernel and dt_bias.  The stable host
-    # layer used to read dim 3 of the packed [H,T,D] q tensor, so every packed
-    # call that also passed dt_bias threw "size_of dim out of range" before the
-    # kernel was reached while the ctypes reference ran normally.  H is even and
-    # both segment lengths are whole chunks so the launch stays a single fused
-    # call instead of the A2 per-sequence or padded-tail rewrites.
+    # Packed varlen spelling.  The stable host layer used to drop
+    # cu_seqlens/chunk_indices, so a packed call was validated as dense
+    # (rank-4 q/h) and rejected with ACLNN_ERR_PARAM_INVALID while the ctypes
+    # reference ran normally.  H is even and the segment length is a whole
+    # number of chunks so the launch stays a single fused call instead of the
+    # A2 per-sequence or padded-tail rewrites.
     Hp, Tp = 4, 128
     NTp = Tp // cs
 
@@ -1448,13 +1448,10 @@ def scenario_chunk_kda_bwd():
     h_p = packed((NTp, Hp, K, V), dt, 5e-2)
     d_o_p = packed((Hp, Tp, V), dt, 5e-2)
     kd = K ** -0.5
-    kw_p = dict(kw, raw_g=packed((Hp, Tp, K), dt),
-                A_log=packed((Hp,), torch.float32),
-                dt_bias=packed((Hp, K), torch.float32, 1e-2),
-                cu_seqlens=[0, Tp], use_gate_in_kernel=True)
+    kw_p = dict(kw, cu_seqlens=[0, Tp])
     torch.npu.synchronize()
     parity_or_domain_skip(
-        "chunk_kda_bwd(packed varlen gate-in-kernel)",
+        "chunk_kda_bwd(packed varlen)",
         lambda: ct.npu_chunk_kda_bwd(
             q_p, k_p, v_p, beta_p, gk_p, Aqk_p, Akk_p, w_p, qg_p, kg_p,
             v_new_p, h_p, d_o_p, kd, **kw_p),
