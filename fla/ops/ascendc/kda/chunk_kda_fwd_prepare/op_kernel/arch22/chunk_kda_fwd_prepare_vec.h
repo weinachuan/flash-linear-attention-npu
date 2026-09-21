@@ -16,6 +16,14 @@
 
 namespace KdaPrepare::Arch22 {
 
+// softplus 的 log1p 分段：u=exp(-|x|) 小于该阈值时走 7 阶级数，否则走 Ln(1+u)。
+// 级数与 mask 复用共享 scratch 的空闲区（V0 阶段只用到前 8 KiB，末尾 0x1F00
+// 起是 sequence-major 的 beta gather 偏移表）。
+constexpr float kGateSeriesThreshold = 0.125F;
+constexpr uint32_t kGateSeriesOffsetBytes = 0x2000;
+constexpr uint32_t kGateMaskOffsetBytes = 0xB000;
+constexpr uint32_t kGateSelectElemsPerRepeat = 64;
+
 template <typename GateT, typename BetaT, typename CompilePolicy>
 class ChunkKdaFwdPrepareVec {
     using Domain = ExpDomainTraits<CompilePolicy::useExp2>;
@@ -837,17 +845,52 @@ private:
             if constexpr (!CompilePolicy::safeGate &&
                           CompilePolicy::gateMode == GateMode::Softplus) {
                 // deltaG=-a*(max(x,0)+log(1+exp(-abs(x))))。
-                // 整块（validRows x 128）一次下发，替代原先每行 8 条指令。
+                // log(1+u) 在小 u 处会把 1+u 的舍入放大成 1e-4~1e-3 的相对
+                // 误差（u 是 exp(-|x|)，档位越小放大越明显），因此把 log1p
+                // 拆成两段：u<0.125 走 7 阶级数（相对误差 ≤6.3e-8），其余仍
+                // 走 Ln(1+u)（阈值处相对误差 ≤4.5e-7），最后用 Select 合并。
+                // 整块（validRows x 128）一次下发，替代原先每行逐指令。
                 const float factor = -gateA;
+                auto gateSeries = scratch[kGateSeriesOffsetBytes / sizeof(float)];
+                auto gateMask = scratch[kGateMaskOffsetBytes / sizeof(float)]
+                                    .template ReinterpretCast<uint8_t>();
                 AscendC::Abs(tileBuf, g, count);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Muls(tileBuf, tileBuf, -1.0F, count);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Exp(tileBuf, tileBuf, count);
                 AscendC::PipeBarrier<PIPE_V>();
+                AscendC::CompareScalar<float, uint8_t>(
+                    gateMask, tileBuf, kGateSeriesThreshold,
+                    AscendC::CMPMODE::LT, count);
+                AscendC::PipeBarrier<PIPE_V>();
+                // Horner：p(u)=1-u/2+u^2/3-u^3/4+u^4/5-u^5/6+u^6/7，
+                // 初始 r=1/7，每级 r = -u*r + c。
+                AscendC::Duplicate(gateSeries, 1.0F / 7.0F, count);
+                AscendC::PipeBarrier<PIPE_V>();
+                for (uint32_t level = 0; level < 6; ++level) {
+                    AscendC::Muls(gateSeries, gateSeries, -1.0F, count);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Mul(gateSeries, gateSeries, tileBuf, count);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Adds(gateSeries, gateSeries,
+                                  1.0F / static_cast<float>(6 - level), count);
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
+                AscendC::Mul(gateSeries, gateSeries, tileBuf, count);
+                AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Adds(tileBuf, tileBuf, 1.0F, count);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Ln(tileBuf, tileBuf, count);
+                AscendC::PipeBarrier<PIPE_V>();
+                // mask 位为 1（u<0.125）取级数，否则取 Ln(1+u)。
+                AscendC::BinaryRepeatParams selectRepeat{1, 1, 1, 8, 8, 8};
+                AscendC::Select(tileBuf, gateMask, tileBuf, gateSeries,
+                                AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+                                kGateSelectElemsPerRepeat,
+                                static_cast<uint8_t>(count /
+                                                     kGateSelectElemsPerRepeat),
+                                selectRepeat);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Maxs(g, g, 0.0F, count);
                 AscendC::PipeBarrier<PIPE_V>();
