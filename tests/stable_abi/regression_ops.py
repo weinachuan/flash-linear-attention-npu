@@ -1410,6 +1410,32 @@ def scenario_chunk_kda_bwd():
                              h, d_o, K ** -0.5, **kw),
         _launcher.npu_chunk_kda_bwd(q, k, v, beta, gk, Aqk, Akk, w, qg, kg,
                                 v_new, h, d_o, K ** -0.5, **kw))
+    # Dense with a short tail: T is not a multiple of chunk_size, so the
+    # adapter pads the last chunk before the launch.  #696 rebuilt the varlen
+    # metadata unconditionally in that branch and crashed the dense spelling
+    # with "object of type 'NoneType' has no len()".
+    Td = cs * NT - 8
+    NTd = -(-Td // cs)
+    q_d = torch.randn(B, H, Td, K, dtype=dt, device="npu") * 5e-2
+    torch.npu.synchronize()
+    parity_or_domain_skip(
+        "chunk_kda_bwd(dense BNSD short tail)",
+        lambda: ct.npu_chunk_kda_bwd(
+            q_d, k[:, :, :Td].contiguous(), v[:, :, :Td].contiguous(),
+            beta[:, :, :Td].contiguous(), gk[:, :, :Td].contiguous(),
+            Aqk[:, :, :Td].contiguous(), Akk[:, :, :Td].contiguous(),
+            w[:, :, :Td].contiguous(), qg[:, :, :Td].contiguous(),
+            kg[:, :, :Td].contiguous(), v_new[:, :, :Td].contiguous(),
+            h[:, :NTd].contiguous(), d_o[:, :, :Td].contiguous(),
+            K ** -0.5, **kw),
+        lambda: _launcher.npu_chunk_kda_bwd(
+            q_d, k[:, :, :Td].contiguous(), v[:, :, :Td].contiguous(),
+            beta[:, :, :Td].contiguous(), gk[:, :, :Td].contiguous(),
+            Aqk[:, :, :Td].contiguous(), Akk[:, :, :Td].contiguous(),
+            w[:, :, :Td].contiguous(), qg[:, :, :Td].contiguous(),
+            kg[:, :, :Td].contiguous(), v_new[:, :, :Td].contiguous(),
+            h[:, :NTd].contiguous(), d_o[:, :, :Td].contiguous(),
+            K ** -0.5, **kw))
     # The remaining declared flags of this operator.
     for label, extra in (("state_v_first", dict(state_v_first=True)),
                          ("recompute", dict(disable_recompute=False))):
