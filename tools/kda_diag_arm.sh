@@ -47,6 +47,9 @@ EXTRA=${EXTRA:-}
 DEV=${DEV:-}
 # REUSE=1（默认）：如果本档位已经用同样的 (RELAY,SWAP,PIPE) 建过包，就跳过 build/install 只跑测
 REUSE=${REUSE:-1}
+# 多个臂并行时，源码目录是共享的：用文件锁把"改宏 + 编译 + 安装"串行化，跑测仍可并行
+LOCK=${LOCK:-$ROOT/.build.lock}
+PIP_NO_CACHE=${PIP_NO_CACHE:-1}
 
 OP=fla/ops/ascendc/kda/chunk_kda_fwd_prepare
 POL=$SRC/$OP/op_kernel/chunk_kda_fwd_prepare_policy.h
@@ -75,7 +78,17 @@ git rev-parse --short HEAD
 git --no-pager log --oneline -1
 git checkout -- "$OP" || true      # 只回滚这个算子的文件，不动你其它改动
 
-# ---------- 1) 设置档位 ----------
+# ---------- 1) 取构建锁（改宏/编译/安装必须串行）----------
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK"
+  echo "等待构建锁 $LOCK ..."
+  flock 9
+  echo "已获得构建锁"
+else
+  echo "!! 本机没有 flock，多个臂并行时构建段可能互相干扰（建议串行跑或安装 util-linux）" >&2
+fi
+
+# ---------- 2) 设置档位 ----------
 set_macro() {  # $1=宏名 $2=值
   if grep -q "^#define $1 " "$POL"; then
     sed -i "s/^#define $1 .*/#define $1 $2/" "$POL"
@@ -105,7 +118,9 @@ if [ "$REUSE" = 1 ] && [ -f "$STATE" ] && [ "$(cat "$STATE")" = "$WANT" ] \
   echo "REUSE=1 且档位未变（$WANT），跳过 build/install"
   W=$(ls -t "$BASE"/wheels/*.whl | head -1)
 else
-  python3 -m pip wheel --no-build-isolation --no-deps . -w "$BASE/wheels" > "$BASE/log/build.log" 2>&1
+  PIP_FLAGS=""
+  [ "$PIP_NO_CACHE" = 1 ] && PIP_FLAGS="--no-cache-dir"
+  python3 -m pip wheel --no-build-isolation --no-deps $PIP_FLAGS . -w "$BASE/wheels" > "$BASE/log/build.log" 2>&1
   echo "build rc=$?"
   tail -3 "$BASE/log/build.log"
   W=$(ls -t "$BASE"/wheels/*.whl | head -1)
@@ -115,6 +130,9 @@ else
   echo "install rc=$?"
   echo "$WANT" > "$STATE"
 fi
+
+# 构建/安装结束，释放构建锁（后面的跑测可以并行）
+if command -v flock >/dev/null 2>&1; then flock -u 9; echo "已释放构建锁"; fi
 
 # ---------- 4) OPP 自检：档位真的进包了吗 ----------
 P=$BASE/py/fla_npu
