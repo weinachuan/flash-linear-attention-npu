@@ -45,6 +45,9 @@ PAUSE=${PAUSE:-0}
 SAVE=${SAVE:-}
 EXTRA=${EXTRA:-}
 DEV=${DEV:-}
+# REV=<commit>：把该算子目录切到指定提交的实现（受控对比用，例如 REV=7b48499d8 跑主线基线）
+REV=${REV:-}
+ALLOW_MISSING_MACRO=${ALLOW_MISSING_MACRO:-0}
 # REUSE=1（默认）：如果本档位已经用同样的 (RELAY,SWAP,PIPE) 建过包，就跳过 build/install 只跑测
 REUSE=${REUSE:-1}
 # 多个臂并行时，源码目录是共享的：用文件锁把"改宏 + 编译 + 安装"串行化，跑测仍可并行
@@ -76,7 +79,12 @@ echo "tool: $TOOL（参数自检通过）"
 cd "$SRC"
 git rev-parse --short HEAD
 git --no-pager log --oneline -1
-git checkout -- "$OP" || true      # 只回滚这个算子的文件，不动你其它改动
+if [ -n "$REV" ]; then
+  echo "=== 切到 REV=$REV 的算子实现（只动 $OP）"
+  git checkout "$REV" -- "$OP" || exit 1
+else
+  git checkout -- "$OP" || true    # 只回滚这个算子的文件，不动你其它改动
+fi
 
 # ---------- 1) 取构建锁（改宏/编译/安装必须串行）----------
 if command -v flock >/dev/null 2>&1; then
@@ -93,8 +101,12 @@ set_macro() {  # $1=宏名 $2=值
   if grep -q "^#define $1 " "$POL"; then
     sed -i "s/^#define $1 .*/#define $1 $2/" "$POL"
   else
-    echo "!! policy.h 里没有 $1，说明源码不是 #865+诊断分支" >&2
-    exit 1
+    if [ "$ALLOW_MISSING_MACRO" = 1 ]; then
+      echo "!! policy.h 里没有 $1（该提交没有这个开关），按 0 处理"
+    else
+      echo "!! policy.h 里没有 $1，说明源码不是 #865+诊断分支；确要跑该提交请加 ALLOW_MISSING_MACRO=1" >&2
+      exit 1
+    fi
   fi
 }
 set_macro CHUNK_KDA_FWD_PREPARE_RELAY_SYNC "$RELAY"
@@ -112,7 +124,7 @@ if [ -n "$DEV" ]; then export ASCEND_RT_VISIBLE_DEVICES="$DEV"; echo "ASCEND_RT_
 export FLA_NPU_SOC=${FLA_NPU_SOC:-ascend910_93}          # A3；A2 用 ascend910b
 export FLA_NPU_OPS=chunk_kda_fwd,chunk_kda_fwd_prepare,chunk_kda_fwd_finalize,chunk_fwd_h
 echo "=== build (SOC=$FLA_NPU_SOC) ==="
-WANT="$RELAY/$SWAP/$PIPE"
+WANT="${REV:-HEAD}/$RELAY/$SWAP/$PIPE"
 if [ "$REUSE" = 1 ] && [ -f "$STATE" ] && [ "$(cat "$STATE")" = "$WANT" ] \
    && ls "$BASE"/wheels/*.whl >/dev/null 2>&1 && [ -d "$BASE/py/fla_npu" ]; then
   echo "REUSE=1 且档位未变（$WANT），跳过 build/install"

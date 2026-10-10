@@ -8,8 +8,9 @@
 #   bash kda_diag_serial.sh
 #
 # 可调环境变量：
-#   ARMS="base:0 pipe4:4 pipe9:9 pipe1:1"   串行顺序，格式 ARM:PIPE（默认就是这四个）
-#   N=5000        每档 trial 数（想快点：N=2000）
+#   ARMS="main:0:7b48499d8 pr865:2:b5b3bc6de pipe4:4:6983a43eb"
+#                 串行顺序，格式 ARM:PIPE[:REV]；REV 用来把该算子目录切到指定提交（受控对比）
+#   N=5000        每档 trial 数（想快点：N=2000，但区分能力会明显下降）
 #   MAXS=3        每档最多收集几个漂移样本
 #   DEV=0         固定用哪张卡（串行跑，不会被别人干扰）
 #   REVERIFY=1    对"0 样本"的档位再单独复跑一次确认（默认 0）
@@ -29,7 +30,7 @@ SWAP=${SWAP:-0}
 PAUSE=${PAUSE:-0}
 REVERIFY=${REVERIFY:-0}
 FORCE=${FORCE:-0}
-ARMS=${ARMS:-"base:0 pipe4:4 pipe9:9 pipe1:1"}
+ARMS=${ARMS:-"main:0:7b48499d8 pr865:2:b5b3bc6de pipe4:4:6983a43eb"}
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ARM_SH=$HERE/kda_diag_arm.sh
@@ -41,16 +42,21 @@ echo "=== 每档: N=$N MAXS=$MAXS DEV=$DEV RELAY=$RELAY SWAP=$SWAP PAUSE=$PAUSE 
 echo "=== 日志: $ROOT/<ARM>/console.log ；汇总: $ROOT/serial_summary.txt"
 echo
 
-run_one() {  # $1=ARM $2=PIPE $3=SAVE $4=tag
+run_one() {  # $1=ARM $2=PIPE $3=SAVE $4=REV
   ARM="$1" PIPE="$2" RELAY="$RELAY" SWAP="$SWAP" DEV="$DEV" \
-  MAXS="$MAXS" N="$N" PAUSE="$PAUSE" SAVE="$3" \
+  MAXS="$MAXS" N="$N" PAUSE="$PAUSE" SAVE="$3" REV="$4" \
+  ALLOW_MISSING_MACRO=1 \
   SRC="$SRC" TOOL="$TOOL" DUMP="$DUMP" ROOT="$ROOT" \
   bash "$ARM_SH"
 }
 
 for spec in $ARMS; do
+  # 规格: ARM:PIPE[:REV]
   ARM=${spec%%:*}
-  PIPE=${spec##*:}
+  rest=${spec#*:}
+  PIPE=${rest%%:*}
+  REV_ARM=""
+  case "$rest" in *:*) REV_ARM=${rest#*:} ;; esac
   LOG=$ROOT/$ARM/console.log
   mkdir -p "$ROOT/$ARM"
   DONE=$ROOT/$ARM/log/run.log
@@ -58,14 +64,14 @@ for spec in $ARMS; do
   if [ "$FORCE" != 1 ] && [ -f "$DONE" ] && grep -q "漂移率: " "$DONE"; then
     echo "=== [$ARM] 已有结果，跳过（FORCE=1 可重跑）"
   else
-    echo "=== [$ARM] PIPE=$PIPE 开始 $(date +%H:%M:%S)"
-    run_one "$ARM" "$PIPE" "$ROOT/$ARM/first.pt" | tee "$LOG"
+    echo "=== [$ARM] PIPE=$PIPE REV=${REV_ARM:-<HEAD>} 开始 $(date +%H:%M:%S)"
+    run_one "$ARM" "$PIPE" "$ROOT/$ARM/first.pt" "$REV_ARM" | tee "$LOG"
     echo "=== [$ARM] 结束 $(date +%H:%M:%S)"
   fi
 
   if [ "$REVERIFY" = 1 ] && [ -f "$DONE" ] && grep -q "漂移率: 0/" "$DONE"; then
     echo "=== [$ARM] 首轮 0 样本 → 单独复跑确认 $(date +%H:%M:%S)"
-    run_one "$ARM" "$PIPE" "$ROOT/$ARM/first_verify.pt" | tee -a "$LOG"
+    run_one "$ARM" "$PIPE" "$ROOT/$ARM/first_verify.pt" "$REV_ARM" | tee -a "$LOG"
   fi
 done
 
