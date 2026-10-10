@@ -182,6 +182,18 @@ def localize_tensor(key, good_val, bad_val, cu):
     return out
 
 
+def progress_bar(done, total, samples, t0, width=25):
+    """一行式进度： [=====>      ] 1250/5000 25.0% 漂移=1 4.2 trial/s ETA 893s"""
+    pct = 100.0 * done / max(1, total)
+    filled = int(round(pct / 100.0 * width))
+    bar = ("=" * filled + (">" if filled < width else "")).ljust(width)
+    elapsed = max(1e-6, time.time() - t0)
+    rate = done / elapsed
+    eta = (total - done) / rate if rate > 0 else 0.0
+    return (f"    [{bar}] {done:>5}/{total} {pct:5.1f}%  漂移样本={len(samples)}  "
+            f"{rate:.1f} trial/s  ETA {eta:.0f}s")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", required=True)
@@ -312,6 +324,9 @@ def main():
         t_bad = None
         samples = []
         trials_run = 0
+        # 进度条：长跑每 ~4% 一行（约 25 行），短跑最多 5 行
+        report_every = max(1, n_trial // (25 if n_trial >= 1000 else 5))
+        t_start = time.time()
         for i in range(n_trial):
             outs = []
             for st in sts:
@@ -366,6 +381,8 @@ def main():
                 if len(samples) >= args.max_samples:
                     break
             trials_run = i + 1
+            if trials_run % report_every == 0 or trials_run == n_trial:
+                log(progress_bar(trials_run, n_trial, samples, t_start))
         return hist, first_bad, t_bad, samples, trials_run
 
     warm = call(ins)
