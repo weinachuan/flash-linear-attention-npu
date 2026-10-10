@@ -29,6 +29,9 @@
 set -euo pipefail
 
 SRC=${SRC:?请指定 #865 的源码检出目录，例如 /data/wnc/flash-linear-attention-npu}
+# 后台并行跑时禁止 pager / 交互提示，避免后台作业读 tty 被 SIGTTIN 停住
+export GIT_PAGER=cat GIT_TERMINAL_PROMPT=0 PAGER=cat
+export GIT_EDITOR=true
 ARM=${ARM:?请给这个档位起个名字，例如 base0 / pipe4 / pipe9 / swap1}
 TOOL=${TOOL:-$(dirname "$0")/kda_v2_localize.py}
 DUMP=${DUMP:?请指定 dump 路径}
@@ -51,7 +54,7 @@ mkdir -p "$BASE"/wheels "$BASE"/py "$BASE"/log
 # ---------- 0) 源码状态 ----------
 cd "$SRC"
 git rev-parse --short HEAD
-git log --oneline -1
+git --no-pager log --oneline -1
 git checkout -- "$OP" || true      # 只回滚这个算子的文件，不动你其它改动
 
 # ---------- 1) 设置档位 ----------
