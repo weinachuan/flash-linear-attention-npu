@@ -116,9 +116,10 @@ set_macro CHUNK_KDA_FWD_PREPARE_RELAY_SYNC "$RELAY"
 set_macro KDA_PREPARE_RELAY_ORDER_SWAP     "$SWAP"
 set_macro KDA_PREPARE_DIAG_PIPE_ALL        "$PIPE"
 echo "=== 本次档位 ==="
-grep -nE "^#define (CHUNK_KDA_FWD_PREPARE_RELAY_SYNC|KDA_PREPARE_RELAY_ORDER_SWAP|KDA_PREPARE_DIAG_PIPE_ALL) " "$POL"
+grep -nE "^#define (CHUNK_KDA_FWD_PREPARE_RELAY_SYNC|KDA_PREPARE_RELAY_ORDER_SWAP|KDA_PREPARE_DIAG_PIPE_ALL) " "$POL" \
+  || echo "  （该提交没有这三个开关 ⇒ 等价于全 0，即主线实现）"
 echo "=== 本次 diff（相对于该分支提交） ==="
-git --no-pager diff --stat -- "$OP"
+git --no-pager diff --stat -- "$OP" || true
 
 # ---------- 2) 建 wheel ----------
 CANN_SET_ENV=${CANN_SET_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}
@@ -153,9 +154,11 @@ if command -v flock >/dev/null 2>&1; then flock -u 9; echo "已释放构建锁";
 P=$BASE/py/fla_npu
 echo "=== 包内 policy 宏 ==="
 grep -nE "^#define (CHUNK_KDA_FWD_PREPARE_RELAY_SYNC|KDA_PREPARE_RELAY_ORDER_SWAP|KDA_PREPARE_DIAG_PIPE_ALL) " \
-  $P/opp/vendors/*/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_kda_fwd_prepare/chunk_kda_fwd_prepare_policy.h
+  $P/opp/vendors/*/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_kda_fwd_prepare/chunk_kda_fwd_prepare_policy.h \
+  || echo "  （包内没有这三个开关 ⇒ 用的是主线实现，这就是 main 臂的凭证）"
 echo "=== 内核对象（名字带源码哈希，跨档位应不同） ==="
-ls -l $P/opp/vendors/*/op_impl/ai_core/tbe/kernel/*/chunk_kda_fwd_prepare/ | tee "$BASE/log/objs.txt" | head
+ls -l $P/opp/vendors/*/op_impl/ai_core/tbe/kernel/*/chunk_kda_fwd_prepare/ 2>/dev/null | tee "$BASE/log/objs.txt" | head \
+  || echo "  （没找到内核对象目录）"
 
 # ---------- 5) 运行环境：PYTHONPATH + custom OPP ----------
 cat > "$BASE/env.sh" <<ENV
