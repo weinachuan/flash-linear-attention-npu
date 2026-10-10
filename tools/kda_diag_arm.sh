@@ -8,6 +8,13 @@
 #   ARM=pipe4 PIPE=4 SWAP=0 RELAY=2 N=5000 \
 #   bash kda_diag_arm.sh
 #
+# 常用的跑测参数（都是环境变量，默认见下）：
+#   N=5000        每个档位跑多少 trial（4 stream → 4×N 次调用）
+#   MAXS=5        收集多少个漂移样本后停止；=1 表示"第一次漂移就停"
+#   PAUSE=1       抓到第一个漂移后暂停等回车（张量保活；stdin 是终端才生效）
+#   SAVE=<path>   把第一个漂移样本的关键小切片存成 .pt（几百 KB，可外发）
+#   EXTRA="..."   额外透传给 kda_v2_localize.py 的参数
+#
 # 运行前请先激活你的 conda 环境（例如 conda activate fzy_atk），脚本会沿用当前
 # python3；CANN 环境脚本默认取 /usr/local/Ascend/ascend-toolkit/set_env.sh，
 # 需要换路径时用 CANN_SET_ENV=/your/cann/set_env.sh。
@@ -29,6 +36,10 @@ N=${N:-5000}
 RELAY=${RELAY:-2}
 SWAP=${SWAP:-0}
 PIPE=${PIPE:-0}
+MAXS=${MAXS:-5}
+PAUSE=${PAUSE:-0}
+SAVE=${SAVE:-}
+EXTRA=${EXTRA:-}
 
 OP=fla/ops/ascendc/kda/chunk_kda_fwd_prepare
 POL=$SRC/$OP/op_kernel/chunk_kda_fwd_prepare_policy.h
@@ -102,8 +113,16 @@ print("ASCEND_CUSTOM_OPP_PATH:", os.environ.get("ASCEND_CUSTOM_OPP_PATH"))
 PY
 
 # ---------- 6) 跑定位 ----------
-echo "=== run: n=$N ==="
-python3 "$TOOL" --dump "$DUMP" --n-stress "$N" --max-samples 5 2>&1 | tee "$BASE/log/run.log"
+ARGS=(--dump "$DUMP" --n-stress "$N" --max-samples "$MAXS")
+[ "$PAUSE" = 1 ] && ARGS+=(--pause-on-first)
+[ -n "$SAVE" ] && ARGS+=(--save-first "$SAVE")
+if [ -n "$EXTRA" ]; then
+  # shellcheck disable=SC2206
+  ARGS+=($EXTRA)
+fi
+echo "=== run: python3 $TOOL ${ARGS[*]} ==="
+echo "    （PAUSE=$PAUSE：只在抓到第一个漂移后暂停；进度条每 ~4% 一行）"
+python3 "$TOOL" "${ARGS[@]}" 2>&1 | tee "$BASE/log/run.log"
 
 echo
 echo "=== 把下面两段贴回来即可 ==="
