@@ -15,6 +15,7 @@
 #   SAVE=<path>   把第一个漂移样本的关键小切片存成 .pt（几百 KB，可外发）
 #   EXTRA="..."   额外透传给 kda_v2_localize.py 的参数
 #   DEV=<id>      指定 ASCEND_RT_VISIBLE_DEVICES（不设则沿用当前环境；多卡可并行跑不同档位）
+#   DR=1          disable_recompute：1=issue 包/scalars 的配置（默认）；0=走 recompute 路径
 #
 # 运行前请先激活你的 conda 环境（例如 conda activate fzy_atk），脚本会沿用当前
 # python3；CANN 环境脚本默认取 /usr/local/Ascend/ascend-toolkit/set_env.sh，
@@ -45,6 +46,7 @@ PAUSE=${PAUSE:-0}
 SAVE=${SAVE:-}
 EXTRA=${EXTRA:-}
 DEV=${DEV:-}
+DR=${DR:-1}
 # REV=<commit>：把该算子目录切到指定提交的实现（受控对比用，例如 REV=7b48499d8 跑主线基线）
 REV=${REV:-}
 ALLOW_MISSING_MACRO=${ALLOW_MISSING_MACRO:-0}
@@ -73,6 +75,7 @@ need_flag() {  # $1=flag $2=开关是否启用
 need_flag --save-first "$([ -n "$SAVE" ] && echo 1 || echo 0)"
 need_flag --pause-on-first "$PAUSE"
 need_flag --max-samples 1
+need_flag --disable-recompute 1
 echo "tool: $TOOL（参数自检通过）"
 
 # ---------- 0) 源码状态 ----------
@@ -174,6 +177,7 @@ PY
 
 # ---------- 6) 跑定位 ----------
 ARGS=(--dump "$DUMP" --n-stress "$N" --max-samples "$MAXS")
+ARGS+=(--disable-recompute "$DR")
 [ "$PAUSE" = 1 ] && ARGS+=(--pause-on-first)
 [ -n "$SAVE" ] && ARGS+=(--save-first "$SAVE")
 if [ -n "$EXTRA" ]; then

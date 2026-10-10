@@ -286,6 +286,9 @@ def main():
                     help="额外跑 [3]/[4] 两组驱动方式对照（用例构造与 [2] 完全相同，只改并发/同步）")
     ap.add_argument("--with-tnd-control", action="store_true",
                     help="额外跑 [5] TND 拼写对照。注意：那不是本 issue 的用例构造，默认不跑")
+    ap.add_argument("--disable-recompute", type=int, default=1, choices=[0, 1],
+                    help="1（默认，= issue 包/scalars 的配置，会返回 w/u/qg/kg/v_new/h）；"
+                         "0 = 走 recompute 路径（这些中间量不再返回，脚本自动只比非 None 的输出）")
     args = ap.parse_args()
 
     log("=" * 78)
@@ -383,7 +386,8 @@ def main():
         f"layout='{layout}', initial_state=None, output_final_state=True, "
         f"cu_seqlens={cu}, chunk_indices=None, safe_gate={s['safe_gate']}, "
         f"lower_bound={s['lower_bound']}, use_gate_in_kernel={s['use_gate_in_kernel']}, "
-        f"A_log=..., dt_bias=..., disable_recompute=True, use_exp2={s['use_exp2']})")
+        f"A_log=..., dt_bias=..., disable_recompute={bool(args.disable_recompute)}, "
+        f"use_exp2={s['use_exp2']})")
 
     def call(inputs):
         return npu_chunk_kda_fwd(
@@ -392,7 +396,8 @@ def main():
             output_final_state=True, cu_seqlens=cu, chunk_indices=None,
             safe_gate=s["safe_gate"], lower_bound=s["lower_bound"],
             use_gate_in_kernel=s["use_gate_in_kernel"], A_log=inputs["A_log"],
-            dt_bias=inputs["dt_bias"], disable_recompute=True, use_exp2=s["use_exp2"])
+            dt_bias=inputs["dt_bias"], disable_recompute=bool(args.disable_recompute),
+            use_exp2=s["use_exp2"])
 
     def run_trials(n_trial, n_streams, sync_per_call=False):
         """与包内多流脚本同结构：每 trial 在 n_streams 个 stream 上各调一次，再 sync。"""

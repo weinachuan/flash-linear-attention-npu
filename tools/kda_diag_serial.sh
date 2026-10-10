@@ -14,6 +14,7 @@
 #   MAXS=3        每档最多收集几个漂移样本
 #   DEV=0         固定用哪张卡（串行跑，不会被别人干扰）
 #   REVERIFY=1    对"0 样本"的档位再单独复跑一次确认（默认 0）
+#   DR=1          disable_recompute：1=issue 包配置（默认）；0=recompute 路径（要对比就分两次跑）
 #   FORCE=1       已有结果的档位也重跑（默认跳过已完成的）
 #   REUSE=1       同档位包已存在则跳过重建（默认 1）
 #
@@ -28,6 +29,7 @@ DEV=${DEV:-0}
 RELAY=${RELAY:-2}
 SWAP=${SWAP:-0}
 PAUSE=${PAUSE:-0}
+DR=${DR:-1}
 REVERIFY=${REVERIFY:-0}
 FORCE=${FORCE:-0}
 ARMS=${ARMS:-"main:0:7b48499d8 pr865:2:b5b3bc6de pipe4:4:6983a43eb"}
@@ -44,7 +46,7 @@ echo
 
 run_one() {  # $1=ARM $2=PIPE $3=SAVE $4=REV
   ARM="$1" PIPE="$2" RELAY="$RELAY" SWAP="$SWAP" DEV="$DEV" \
-  MAXS="$MAXS" N="$N" PAUSE="$PAUSE" SAVE="$3" REV="$4" \
+  MAXS="$MAXS" N="$N" PAUSE="$PAUSE" SAVE="$3" REV="$4" DR="$DR" \
   ALLOW_MISSING_MACRO=1 \
   SRC="$SRC" TOOL="$TOOL" DUMP="$DUMP" ROOT="$ROOT" \
   bash "$ARM_SH"
