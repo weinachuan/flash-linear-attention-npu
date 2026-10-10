@@ -135,6 +135,10 @@ def main():
     ap.add_argument("--streams", type=int, default=4)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--skip-npu", action="store_true")
+    ap.add_argument("--skip-controls", action="store_true",
+                    help="跳过 [3]/[4] 两组驱动方式对照（用例构造与 [2] 完全相同，只改并发/同步）")
+    ap.add_argument("--with-tnd-control", action="store_true",
+                    help="额外跑 [5] TND 拼写对照。注意：那不是本 issue 的用例构造，默认不跑")
     args = ap.parse_args()
 
     log("=" * 78)
@@ -236,145 +240,187 @@ def main():
     torch.npu.set_device(args.device)
     from fla_npu.ops.ascendc import npu_chunk_kda_fwd
 
-    ins = {k: (v.to("npu") if torch.is_tensor(v) else v) for k, v in fwd_in.items()}
     layout = str(s["layout"]).upper()
+    ins = {k: (v.to("npu") if torch.is_tensor(v) else v) for k, v in fwd_in.items()}
+    log("=" * 78)
+    log("[2] 现场复现：用例构造严格取自 issue 包（不转置、不合成、不改参数）")
+    log("    输入 = dump 的 fwd_inputs（与 recompute_inputs 逐位相同），落到 NPU 后原样使用：")
+    for k in ("q_in", "k_in", "v_in", "g_in", "beta_in", "A_log", "dt_bias"):
+        v = ins[k]
+        log(f"      {k:>10}: shape={tuple(v.shape)} dtype={v.dtype} "
+            f"contig={v.is_contiguous() if hasattr(v, 'is_contiguous') else True}")
+    log("    参数 = dump 的 scalars，调用形式与包内 kda_stress_multistream.py 完全一致：")
+    log(f"      npu_chunk_kda_fwd(q,k,v,g,beta, {s['scale']}, {s['chunk_size']}, "
+        f"layout='{layout}', initial_state=None, output_final_state=True, "
+        f"cu_seqlens={cu}, chunk_indices=None, safe_gate={s['safe_gate']}, "
+        f"lower_bound={s['lower_bound']}, use_gate_in_kernel={s['use_gate_in_kernel']}, "
+        f"A_log=..., dt_bias=..., disable_recompute=True, use_exp2={s['use_exp2']})")
 
-    def call(lay, inputs):
+    def call(inputs):
         return npu_chunk_kda_fwd(
             inputs["q_in"], inputs["k_in"], inputs["v_in"], inputs["g_in"], inputs["beta_in"],
-            s["scale"], s["chunk_size"], layout=lay, initial_state=None,
+            s["scale"], s["chunk_size"], layout=layout, initial_state=None,
             output_final_state=True, cu_seqlens=cu, chunk_indices=None,
             safe_gate=s["safe_gate"], lower_bound=s["lower_bound"],
             use_gate_in_kernel=s["use_gate_in_kernel"], A_log=inputs["A_log"],
             dt_bias=inputs["dt_bias"], disable_recompute=True, use_exp2=s["use_exp2"])
 
-    def tnd_inputs(inputs):
-        return {k: (v.transpose(0, 1).contiguous() if torch.is_tensor(v) and v.dim() >= 2
-                    and k in ("q_in", "k_in", "v_in", "g_in", "beta_in") else v)
-                for k, v in inputs.items()}
+    def run_trials(n_trial, n_streams, sync_per_call=False):
+        """与包内多流脚本同结构：每 trial 在 n_streams 个 stream 上各调一次，再 sync。"""
+        sts = [torch.npu.Stream() for _ in range(n_streams)]
+        hist = [dict() for _ in range(n_streams)]
+        first_bad = None
+        t_bad = None
+        for i in range(n_trial):
+            outs = []
+            for st in sts:
+                with torch.npu.stream(st):
+                    outs.append(call(ins))
+                if sync_per_call:
+                    torch.npu.synchronize()
+            torch.npu.synchronize()
+            per = {k: [] for k in KEYS}
+            for si, o in enumerate(outs):
+                fps = {}
+                for k, v in zip(KEYS, o):
+                    if v is None:
+                        continue
+                    fps[k] = fp(v)
+                    per[k].append(fps[k])
+                hist[si][i] = fps
+            bad = [k for k in KEYS if len(set(per[k])) > 1]
+            if bad and first_bad is None:
+                first_bad, t_bad = outs, i
+        return hist, first_bad, t_bad
 
-    log("=" * 78)
-    log(f"[2] 现场复现（{layout}，{args.streams} stream × {args.n_stress} trial）")
-    warm = call(layout, ins)
+    warm = call(ins)
     torch.npu.synchronize()
     golden = {k: v.clone() for k, v in zip(KEYS, warm) if v is not None}
+    log(f"[2] 运行 {args.streams} stream × {args.n_stress} trial")
     log("    warm fp: " + ", ".join(f"{k}={fp(v)[0]:.4g}" for k, v in golden.items()))
-
-    streams = [torch.npu.Stream() for _ in range(args.streams)]
-    uniq = {k: set() for k in KEYS}
-    cross = {k: 0 for k in KEYS}
-    first_sample = None
-    first_trial = None
     t0 = time.time()
-    for i in range(args.n_stress):
-        outs = []
-        for st in streams:
-            with torch.npu.stream(st):
-                outs.append(call(layout, ins))
-        torch.npu.synchronize()
-        per = {k: [] for k in KEYS}
-        for o in outs:
-            for k, v in zip(KEYS, o):
-                if v is None:
-                    continue
-                per[k].append(fp(v))
-                uniq[k].add(fp(v))
-        bad = [k for k in KEYS if len(set(per[k])) > 1]
-        if bad and first_sample is None:
-            first_sample = outs
-            first_trial = i
-        for k in bad:
-            cross[k] += 1
-        if (i + 1) % 50 == 0:
-            log(f"    [{i+1}/{args.n_stress}] cross_drift={ {k: cross[k] for k in KEYS if cross[k]} } "
-                f"{time.time() - t0:.0f}s")
-    hit_desc = ", ".join(f"{k}={cross[k]}" for k in KEYS if cross[k]) or "无"
-    log(f"    结果: trial 总数={args.n_stress}, 跨 stream 漂移 trial: {hit_desc}")
-    log("    每 tensor unique_fp: " + ", ".join(f"{k}={len(uniq[k])}" for k in KEYS))
-    if first_trial is not None:
-        log(f"    首个跨 stream 漂移 trial = {first_trial}")
+    hist, first_bad, t_bad = run_trials(args.n_stress, args.streams)
+
+    log("    [每个 stream 内部一致性]")
+    inner_bad = False
+    for si in range(args.streams):
+        fps_all = [tuple(sorted(h.items())) for h in hist[si].values() if h]
+        if len(set(fps_all)) > 1:
+            n_uniq = len(set(fps_all))
+            keys = [k for k in KEYS
+                    if len({h[k] for h in hist[si].values() if k in h}) > 1]
+            log(f"      ✗ stream {si}: {n_uniq} unique fps（{keys}）")
+            inner_bad = True
+    if not inner_bad:
+        log(f"      ✓ 每个 stream 内部 {args.n_stress} trial 一致")
+
+    log("    [跨 stream 一致性]")
+    cross_bad = []
+    for k in KEYS:
+        trials = []
+        for i in range(args.n_stress):
+            vals = [hist[si][i].get(k) for si in range(args.streams) if i in hist[si]]
+            vals = [v for v in vals if v is not None]
+            if len(set(vals)) > 1:
+                trials.append(i)
+        if trials:
+            cross_bad.append((k, trials))
+            log(f"      ✗ {k}: 在 {len(trials)} 个 trial 上跨 stream 不一致 "
+                f"(e.g., trial {trials[:5]})")
+    if not cross_bad:
+        log(f"      ✓ 跨 stream {args.n_stress} trial 一致")
+    log(f"    漂移率: {sum(1 for i in range(args.n_stress) if any(i in t for _, t in cross_bad))}"
+        f"/{args.n_stress} trial, 用时 {time.time() - t0:.0f}s")
+
+    if first_bad is not None:
+        log(f"    [首个漂移 trial={t_bad} 的现场快照]")
         inconsistent = []
         for k in DEP_ORDER:
-            vals = [o[KEYS.index(k)] for o in first_sample]
+            vals = [o[KEYS.index(k)] for o in first_bad]
             if any(v is None for v in vals):
                 continue
             if len({tuple(fp(v)) for v in vals}) > 1:
                 inconsistent.append(k)
-        log(f"    该 trial 上跨 stream 不一致的 tensor: {inconsistent}")
-        for k in inconsistent:
-            vals = [o[KEYS.index(k)] for o in first_sample]
+        log(f"      跨 stream 不一致的 tensor: {inconsistent}")
+        for k in DEP_ORDER:
+            if k not in inconsistent:
+                continue
+            vals = [o[KEYS.index(k)] for o in first_bad]
             a = vals[0]
             others = [v for v in vals[1:] if not torch.equal(v, a)]
             if not others:
                 continue
             dd = (a != others[0])
             idx = torch.nonzero(dd)
-            log(f"    最早注入点(按依赖顺序)={k}: heads={torch.unique(idx[:, 1]).tolist()} "
-                f"dim0=[{int(torch.unique(idx[:, 0]).min())}..{int(torch.unique(idx[:, 0]).max())}] "
-                f"ndiff={int(dd.sum())} 坏侧 {region_stats(others[0][dd])}")
+            ax = head_token_axes(k)
+            if ax is not None:
+                ha, ta = ax
+                heads = torch.unique(idx[:, ha]).tolist()
+                toks = torch.unique(idx[:, ta])
+                seq, cin, slen = locate_token(int(toks.min()), cu)
+                log(f"      最早漂移点={k}: heads={heads} tokens=[{int(toks.min())}..{int(toks.max())}] "
+                    f"-> seq={seq}(len={slen}) chunk_in_seq={cin} ndiff={int(dd.sum())} "
+                    f"坏侧 {region_stats(others[0][dd])}")
+            else:
+                log(f"      最早漂移点={k}: dim0={torch.unique(idx[:, 0])[:6].tolist()} "
+                    f"dim1={torch.unique(idx[:, 1]).tolist()} ndiff={int(dd.sum())} "
+                    f"坏侧 {region_stats(others[0][dd])}")
             break
+    else:
+        log("    [首个漂移 trial] 本次没抓到（n 不够）")
 
-    log("=" * 78)
-    log(f"[3] 并发度扫描（{layout}，{args.n_scan} trial/档）")
-    for ns in (1, 2, 4, 8):
-        sts = [torch.npu.Stream() for _ in range(ns)]
-        hit = 0
-        for i in range(args.n_scan):
-            outs = []
-            for st in sts:
-                with torch.npu.stream(st):
-                    outs.append(call(layout, ins))
-            torch.npu.synchronize()
-            per = {k: [] for k in KEYS}
-            for o in outs:
-                for k, v in zip(KEYS, o):
-                    if v is not None:
-                        per[k].append(fp(v))
-            if any(len(set(per[k])) > 1 for k in KEYS):
-                hit += 1
-        log(f"    streams={ns}: 漂移 trial={hit}/{args.n_scan}")
+    if not args.skip_controls:
+        log("=" * 78)
+        log("[3] 驱动方式对照·并发度扫描（用例构造与 [2] 完全相同，只改并发数）")
+        for ns in (1, 2, 4, 8):
+            hist_c, bad_c, _ = run_trials(args.n_scan, ns)
+            hit = sum(1 for i in range(args.n_scan)
+                      if any(len({hist_c[si][i].get(k) for si in range(ns)
+                                  if i in hist_c[si] and k in hist_c[si][i]}) > 1 for k in KEYS))
+            log(f"      streams={ns}: 漂移 trial={hit}/{args.n_scan}")
 
-    log("=" * 78)
-    log(f"[4] 是否必须「调用在时间上重叠」（{layout}，4 stream，每次调用后 sync）")
-    sts = [torch.npu.Stream() for _ in range(4)]
-    hit = 0
-    for i in range(args.n_scan):
-        outs = []
-        for st in sts:
-            with torch.npu.stream(st):
-                outs.append(call(layout, ins))
-            torch.npu.synchronize()
-        per = {k: [] for k in KEYS}
-        for o in outs:
-            for k, v in zip(KEYS, o):
-                if v is not None:
-                    per[k].append(fp(v))
-        if any(len(set(per[k])) > 1 for k in KEYS):
-            hit += 1
-    log(f"    漂移 trial={hit}/{args.n_scan}（0 ⇒ 必须两次调用同时在飞）")
+        log("=" * 78)
+        log("[4] 驱动方式对照·是否必须「两次调用同时在飞」（4 stream，每次调用后 sync）")
+        hist_d, bad_d, _ = run_trials(args.n_scan, 4, sync_per_call=True)
+        hit = sum(1 for i in range(args.n_scan)
+                  if any(len({hist_d[si][i].get(k) for si in range(4)
+                              if i in hist_d[si] and k in hist_d[si][i]}) > 1 for k in KEYS))
+        log(f"      漂移 trial={hit}/{args.n_scan}（0 ⇒ 触发条件是『调用时间重叠』）")
 
-    log("=" * 78)
-    log(f"[5] 拼写对照（TND，4 stream × {args.n_scan} trial）")
-    try:
-        ins_t = tnd_inputs(ins)
-        sts = [torch.npu.Stream() for _ in range(4)]
-        hit = 0
-        for i in range(args.n_scan):
-            outs = []
-            for st in sts:
-                with torch.npu.stream(st):
-                    outs.append(call("TND", ins_t))
-            torch.npu.synchronize()
-            per = {k: [] for k in KEYS}
-            for o in outs:
-                for k, v in zip(KEYS, o):
-                    if v is not None:
-                        per[k].append(fp(v))
-            if any(len(set(per[k])) > 1 for k in KEYS):
-                hit += 1
-        log(f"    TND 漂移 trial={hit}/{args.n_scan}")
-    except Exception as exc:
-        log(f"    TND 对照失败: {exc}")
+    if args.with_tnd_control:
+        log("=" * 78)
+        log("[5] 注意：这不是 issue 的用例构造（改用 TND 拼写），仅作对照")
+        ins_t = {k: (v.transpose(0, 1).contiguous() if torch.is_tensor(v) and v.dim() >= 2
+                     and k in ("q_in", "k_in", "v_in", "g_in", "beta_in") else v)
+                 for k, v in ins.items()}
+        layout_t = "TND"
+        try:
+            sts = [torch.npu.Stream() for _ in range(4)]
+            hit = 0
+            for i in range(args.n_scan):
+                outs = []
+                for st in sts:
+                    with torch.npu.stream(st):
+                        outs.append(npu_chunk_kda_fwd(
+                            ins_t["q_in"], ins_t["k_in"], ins_t["v_in"], ins_t["g_in"],
+                            ins_t["beta_in"], s["scale"], s["chunk_size"], layout=layout_t,
+                            initial_state=None, output_final_state=True, cu_seqlens=cu,
+                            chunk_indices=None, safe_gate=s["safe_gate"],
+                            lower_bound=s["lower_bound"],
+                            use_gate_in_kernel=s["use_gate_in_kernel"],
+                            A_log=ins_t["A_log"], dt_bias=ins_t["dt_bias"],
+                            disable_recompute=True, use_exp2=s["use_exp2"]))
+                torch.npu.synchronize()
+                per = {k: [] for k in KEYS}
+                for o in outs:
+                    for k, v in zip(KEYS, o):
+                        if v is not None:
+                            per[k].append(fp(v))
+                if any(len(set(per[k])) > 1 for k in KEYS):
+                    hit += 1
+            log(f"      TND 漂移 trial={hit}/{args.n_scan}")
+        except Exception as exc:
+            log(f"      TND 对照失败: {exc}")
 
     log("=" * 78)
     log("[done] 把上面的完整输出贴回来即可")
