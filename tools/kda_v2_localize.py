@@ -90,7 +90,7 @@ def head_token_axes(key):
     return None
 
 
-def copy_hunt(key, fwd_out, rec_out, inputs):
+def copy_hunt(key, fwd_out, rec_out, inputs, skip=()):
     """坏区是不是「别人的数据」：同调用内各 tensor 的同位置内容 + 输入 + 同张量平移。
 
     如果坏值与某个张量在某个固定映射下逐位相同 ⇒ 像"脏写/错误搬运"；
@@ -105,6 +105,8 @@ def copy_hunt(key, fwd_out, rec_out, inputs):
     for name, t in list(rec_out.items()) + list(fwd_out.items()):
         if name == key:
             continue  # 自己比自己必然全等，跳过
+        if any(t is s for s in skip):
+            continue  # 坏张量自身/其参考值不参与匹配
         if t is None or t.numel() != rec_flat.numel():
             continue
         c = int((t.reshape(-1)[idx] == region).sum())
@@ -185,6 +187,8 @@ def main():
     ap.add_argument("--dump", required=True)
     ap.add_argument("--n-stress", type=int, default=2000)
     ap.add_argument("--n-scan", type=int, default=200)
+    ap.add_argument("--max-samples", type=int, default=5,
+                    help="最多收集多少个漂移样本的落点信息（每个样本只记摘要，不落盘）")
     ap.add_argument("--streams", type=int, default=4)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--skip-npu", action="store_true")
@@ -306,6 +310,8 @@ def main():
         hist = [dict() for _ in range(n_streams)]
         first_bad = None
         t_bad = None
+        samples = []
+        trials_run = 0
         for i in range(n_trial):
             outs = []
             for st in sts:
@@ -324,10 +330,43 @@ def main():
                     per[k].append(fps[k])
                 hist[si][i] = fps
             bad = [k for k in KEYS if len(set(per[k])) > 1]
-            if bad and first_bad is None:
-                first_bad, t_bad = outs, i
-                break  # 抓到首个样本就停，现场取证比"跑满 n 统计概率"更值钱
-        return hist, first_bad, t_bad
+            if bad:
+                # 与 warm 比，判出"坏的一侧"（哪个 stream 的输出与 warm 不一致）
+                bad_side = {}
+                for k in KEYS:
+                    if k not in golden:
+                        continue
+                    g = fp(golden[k])
+                    for si, o in enumerate(outs):
+                        v = o[KEYS.index(k)]
+                        if v is not None and fp(v) != g:
+                            bad_side.setdefault(k, (si, v))
+                            break
+                target = next((k for k in DEP_ORDER if k in bad_side), None)
+                loc = None
+                if target is not None:
+                    si, bad_val = bad_side[target]
+                    idx = torch.nonzero(golden[target] != bad_val)
+                    ax = head_token_axes(target)
+                    if ax is not None:
+                        ha, ta = ax
+                        heads = torch.unique(idx[:, ha]).tolist()
+                        toks = torch.unique(idx[:, ta])
+                        seq, cin, slen = locate_token(int(toks.min()), cu)
+                        ordn = [o for (sq, c, o, t0) in chunk_map(cu) if sq == seq and c == cin]
+                        loc = (target, heads, int(toks.min()), int(toks.max()), seq, cin,
+                               ordn[0] if ordn else None)
+                    else:
+                        loc = (target, None, int(torch.unique(idx[:, 0]).min()),
+                               int(torch.unique(idx[:, 0]).max()), None, None, None)
+                samples.append({"trial": i, "bad": sorted(bad_side), "target": target,
+                                "loc": loc, "bad_side": bad_side})
+                if first_bad is None:
+                    first_bad, t_bad = outs, i
+                if len(samples) >= args.max_samples:
+                    break
+            trials_run = i + 1
+        return hist, first_bad, t_bad, samples, trials_run
 
     warm = call(ins)
     torch.npu.synchronize()
@@ -335,7 +374,7 @@ def main():
     log(f"[2] 运行 {args.streams} stream × {args.n_stress} trial")
     log("    warm fp: " + ", ".join(f"{k}={fp(v)[0]:.4g}" for k, v in golden.items()))
     t0 = time.time()
-    hist, first_bad, t_bad = run_trials(args.n_stress, args.streams)
+    hist, first_bad, t_bad, samples, trials_run = run_trials(args.n_stress, args.streams)
 
     log("    [每个 stream 内部一致性]")
     inner_bad = False
@@ -365,8 +404,32 @@ def main():
                 f"(e.g., trial {trials[:5]})")
     if not cross_bad:
         log(f"      ✓ 跨 stream {args.n_stress} trial 一致")
-    log(f"    漂移率: {sum(1 for i in range(args.n_stress) if any(i in t for _, t in cross_bad))}"
-        f"/{args.n_stress} trial, 用时 {time.time() - t0:.0f}s")
+    log(f"    漂移率: {len(samples)}/{trials_run} trial（实际跑过的 trial 数）, "
+        f"用时 {time.time() - t0:.0f}s")
+
+    if samples:
+        log("    [样本落点表]（用于判断是不是每次都在同一个 work item）")
+        log("      trial | 最早漂移 | head | tokens | seq | chunk_in_seq | global_chunk | 同调用下游")
+        for s in samples:
+            loc = s["loc"]
+            if loc is None:
+                log(f"      {s['trial']:>5} | {str(s['target']):>8} | (warm 自身偶发，无坏侧)")
+                continue
+            tgt, heads, tlo, thi, seq, cin, glob = loc
+            down = [k for k in DEP_ORDER if k != tgt and k in s["bad"]]
+            log(f"      {s['trial']:>5} | {tgt:>8} | {heads} | [{tlo}..{thi}] | {seq} | {cin} "
+                f"| {glob} | {down}")
+        glob_hist = {}
+        head_hist = {}
+        for s in samples:
+            loc = s["loc"]
+            if loc is None:
+                continue
+            glob_hist[loc[6]] = glob_hist.get(loc[6], 0) + 1
+            key = tuple(loc[1]) if loc[1] else None
+            head_hist[key] = head_hist.get(key, 0) + 1
+        log(f"      global_chunk 直方图: {glob_hist}")
+        log(f"      head 直方图: {head_hist}")
 
     if first_bad is not None:
         log(f"    [首个漂移 trial={t_bad} 的现场快照（与 warm 比，判「坏的一侧」）]")
@@ -413,7 +476,7 @@ def main():
         log("=" * 78)
         log("[3] 驱动方式对照·并发度扫描（用例构造与 [2] 完全相同，只改并发数）")
         for ns in (1, 2, 4, 8):
-            hist_c, bad_c, _ = run_trials(args.n_scan, ns)
+            hist_c, bad_c, _, _, _ = run_trials(args.n_scan, ns)
             hit = sum(1 for i in range(args.n_scan)
                       if any(len({hist_c[si][i].get(k) for si in range(ns)
                                   if i in hist_c[si] and k in hist_c[si][i]}) > 1 for k in KEYS))
@@ -421,7 +484,7 @@ def main():
 
         log("=" * 78)
         log("[4] 驱动方式对照·是否必须「两次调用同时在飞」（4 stream，每次调用后 sync）")
-        hist_d, bad_d, _ = run_trials(args.n_scan, 4, sync_per_call=True)
+        hist_d, bad_d, _, _, _ = run_trials(args.n_scan, 4, sync_per_call=True)
         hit = sum(1 for i in range(args.n_scan)
                   if any(len({hist_d[si][i].get(k) for si in range(4)
                               if i in hist_d[si] and k in hist_d[si][i]}) > 1 for k in KEYS))
