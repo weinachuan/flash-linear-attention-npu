@@ -633,7 +633,8 @@ def main():
                             lower_bound=s["lower_bound"],
                             use_gate_in_kernel=s["use_gate_in_kernel"],
                             A_log=ins_t["A_log"], dt_bias=ins_t["dt_bias"],
-                            disable_recompute=True, use_exp2=s["use_exp2"]))
+                            disable_recompute=bool(args.disable_recompute),
+                            use_exp2=s["use_exp2"]))
                 torch.npu.synchronize()
                 per = {k: [] for k in KEYS}
                 for o in outs:
