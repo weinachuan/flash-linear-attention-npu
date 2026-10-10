@@ -15,8 +15,9 @@ TORCH_NPU_GDN_FIX_MINIMUMS[torch], triton-ascend >= 3.2.1 on CANN 9.x
 from __future__ import annotations
 
 # CANN minimum per product tier: 950 (a5) requires CANN >= 9.0.0, while
-# 910b/910_93 (a2/a3) follow the README promise of >= 8.5.2.
-MIN_CANN_BY_TIER = {"a2": "8.5.2", "a3": "8.5.2", "a5": "9.0.0"}
+# 910b/910_93 (a2/a3) follow the README promise of >= 8.5.2; A6
+# (Ascend960DT, a6) first ships its kernels with CANN 9.2.0.
+MIN_CANN_BY_TIER = {"a2": "8.5.2", "a3": "8.5.2", "a5": "9.0.0", "a6": "9.2.0"}
 MIN_CANN = MIN_CANN_BY_TIER["a2"]
 # The Stable-ABI launcher resolves aoti_torch_* symbols that exist from 2.7.1
 # on, which is also the lower bound the wheel declares (Requires-Dist). Below
