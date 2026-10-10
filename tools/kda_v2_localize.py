@@ -130,7 +130,16 @@ def copy_hunt(key, fwd_out, rec_out, inputs, skip=()):
     return hits[:5]
 
 
-def akk_probe(u_good, u_bad, akk, v_in, beta_in):
+def _chunk_start(tok, cu, chunk=CHUNK):
+    """把 token 对齐到它所在 chunk 的起点（varlen：序列起点 + chunk 的整数倍）。"""
+    if cu:
+        for a, b in zip(cu, list(cu)[1:]):
+            if a <= tok < b:
+                return a + ((tok - a) // chunk) * chunk
+    return (tok // chunk) * chunk
+
+
+def akk_probe(u_good, u_bad, akk, v_in, beta_in, cu=None, chunk=CHUNK):
     """用 Akk 反解：rec 的 u 是否「用正确操作数算得出来」。
 
     返回一行结论字符串；异常时返回原因。
@@ -138,8 +147,11 @@ def akk_probe(u_good, u_bad, akk, v_in, beta_in):
     try:
         idx = torch.nonzero(u_good != u_bad)
         head = int(torch.unique(idx[:, 0]).min())
-        tok = int(torch.unique(idx[:, 1]).min())
-        block = 64
+        tok_min = int(torch.unique(idx[:, 1]).min())
+        tok = _chunk_start(tok_min, cu, chunk)      # 必须对齐到 chunk 起点
+        if tok + chunk > u_good.shape[1]:
+            tok = max(0, u_good.shape[1] - chunk)
+        block = chunk
         A = bf(akk[head, tok:tok + block]).double()
         ug = bf(u_good[head, tok:tok + block]).double()
         ub = bf(u_bad[head, tok:tok + block]).double()
@@ -153,7 +165,8 @@ def akk_probe(u_good, u_bad, akk, v_in, beta_in):
         corr_r = float(torch.corrcoef(torch.stack([pred.reshape(-1), ub.reshape(-1)]))[0, 1])
         corr_v = float(torch.corrcoef(torch.stack([Vu.reshape(-1), (vv * bt).reshape(-1)]))[0, 1])
         tag = "操作数侧/交接侧" if res_r > 1e-3 else "写回/搬运侧"
-        return (f"      Akk 反解: V_beta vs v*beta corr={corr_v:.4f} | "
+        return (f"      Akk 反解(block 起点={tok}, 对齐 {tok_min}): "
+                f"V_beta vs v*beta corr={corr_v:.4f} | "
                 f"rel_res(好侧)={res_f:.3e} corr={corr_f:.4f} | "
                 f"rel_res(坏侧)={res_r:.3e} corr={corr_r:.4f} => {tag}")
     except Exception as exc:  # noqa: BLE001
@@ -344,7 +357,7 @@ def main():
     log("[1f] Akk 反解：rec 的 u 是否与「正确操作数」的 GEMM 一致")
     if "u" in drifted:
         log(akk_probe(fwd_out["u"], rec_out["u"], fwd_out["Akk"],
-                      fwd_in["v_in"], fwd_in["beta_in"]))
+                      fwd_in["v_in"], fwd_in["beta_in"], cu=cu))
     else:
         log("    (本 dump 的 u 没有漂移，跳过)")
 
@@ -554,13 +567,14 @@ def main():
                     v = o[KEYS.index(k2)]
                     if v is not None:
                         ro[f"s{j}:{k2}"] = v
-            hits = copy_hunt(target, fo, ro, ins)
+            hits = copy_hunt(target, fo, ro, ins, skip=(bad_val, good_val))
             n_bad = int((good_val != bad_val).sum())
             frac = (hits[0][0] / max(1, n_bad)) if hits else 0.0
             log(f"      脏写检查: 最佳匹配={hits[0] if hits else None} best_frac={frac:.4f} "
                 f"({ '疑似抄了别的张量/错位搬运' if frac > 0.5 else '匹配不上 ⇒ 像读到没人写过的地方' })")
             if target == "u":
-                log(akk_probe(good_val, bad_val, golden["Akk"], ins["v_in"], ins["beta_in"]))
+                log(akk_probe(good_val, bad_val, golden["Akk"], ins["v_in"], ins["beta_in"],
+                              cu=cu))
             downstream = [k for k in DEP_ORDER if k != target and k in bad_info]
             log(f"      同一次调用里下游也漂: {downstream}")
     else:

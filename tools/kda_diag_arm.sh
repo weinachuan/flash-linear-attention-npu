@@ -14,6 +14,7 @@
 #   PAUSE=1       抓到第一个漂移后暂停等回车（张量保活；stdin 是终端才生效）
 #   SAVE=<path>   把第一个漂移样本的关键小切片存成 .pt（几百 KB，可外发）
 #   EXTRA="..."   额外透传给 kda_v2_localize.py 的参数
+#   DEV=<id>      指定 ASCEND_RT_VISIBLE_DEVICES（不设则沿用当前环境；多卡可并行跑不同档位）
 #
 # 运行前请先激活你的 conda 环境（例如 conda activate fzy_atk），脚本会沿用当前
 # python3；CANN 环境脚本默认取 /usr/local/Ascend/ascend-toolkit/set_env.sh，
@@ -40,6 +41,7 @@ MAXS=${MAXS:-5}
 PAUSE=${PAUSE:-0}
 SAVE=${SAVE:-}
 EXTRA=${EXTRA:-}
+DEV=${DEV:-}
 
 OP=fla/ops/ascendc/kda/chunk_kda_fwd_prepare
 POL=$SRC/$OP/op_kernel/chunk_kda_fwd_prepare_policy.h
@@ -72,6 +74,7 @@ git --no-pager diff --stat -- "$OP"
 # ---------- 2) 建 wheel ----------
 CANN_SET_ENV=${CANN_SET_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}
 source "$CANN_SET_ENV"
+if [ -n "$DEV" ]; then export ASCEND_RT_VISIBLE_DEVICES="$DEV"; echo "ASCEND_RT_VISIBLE_DEVICES=$DEV"; fi
 export FLA_NPU_SOC=${FLA_NPU_SOC:-ascend910_93}          # A3；A2 用 ascend910b
 export FLA_NPU_OPS=chunk_kda_fwd,chunk_kda_fwd_prepare,chunk_kda_fwd_finalize,chunk_fwd_h
 echo "=== build (SOC=$FLA_NPU_SOC) ==="
