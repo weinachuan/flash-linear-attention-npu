@@ -45,11 +45,29 @@ PAUSE=${PAUSE:-0}
 SAVE=${SAVE:-}
 EXTRA=${EXTRA:-}
 DEV=${DEV:-}
+# REUSE=1（默认）：如果本档位已经用同样的 (RELAY,SWAP,PIPE) 建过包，就跳过 build/install 只跑测
+REUSE=${REUSE:-1}
 
 OP=fla/ops/ascendc/kda/chunk_kda_fwd_prepare
 POL=$SRC/$OP/op_kernel/chunk_kda_fwd_prepare_policy.h
 BASE=$ROOT/$ARM
 mkdir -p "$BASE"/wheels "$BASE"/py "$BASE"/log
+STATE=$BASE/.arm_state
+
+# ---------- 0) 先检查工具脚本参数（避免白跑一趟）----------
+TOOL_HELP=$(python3 "$TOOL" -h 2>&1 || true)
+need_flag() {  # $1=flag $2=开关是否启用
+  [ "$2" = 1 ] || return 0
+  if ! printf '%s' "$TOOL_HELP" | grep -q -- "$1"; then
+    echo "!! $TOOL 不支持 $1，请先更新 kda_v2_localize.py：" >&2
+    echo "   curl -fsSL -o $TOOL https://raw.githubusercontent.com/weinachuan/flash-linear-attention-npu/codex/kda-v2-localize-tool/tools/kda_v2_localize.py" >&2
+    exit 2
+  fi
+}
+need_flag --save-first "$([ -n "$SAVE" ] && echo 1 || echo 0)"
+need_flag --pause-on-first "$PAUSE"
+need_flag --max-samples 1
+echo "tool: $TOOL（参数自检通过）"
 
 # ---------- 0) 源码状态 ----------
 cd "$SRC"
@@ -81,16 +99,22 @@ if [ -n "$DEV" ]; then export ASCEND_RT_VISIBLE_DEVICES="$DEV"; echo "ASCEND_RT_
 export FLA_NPU_SOC=${FLA_NPU_SOC:-ascend910_93}          # A3；A2 用 ascend910b
 export FLA_NPU_OPS=chunk_kda_fwd,chunk_kda_fwd_prepare,chunk_kda_fwd_finalize,chunk_fwd_h
 echo "=== build (SOC=$FLA_NPU_SOC) ==="
-python3 -m pip wheel --no-build-isolation --no-deps . -w "$BASE/wheels" > "$BASE/log/build.log" 2>&1
-echo "build rc=$?"
-tail -3 "$BASE/log/build.log"
-W=$(ls -t "$BASE"/wheels/*.whl | head -1)
-echo "wheel: $W"
-
-# ---------- 3) 安装到独立目录 ----------
-rm -rf "$BASE/py"
-python3 -m pip install --upgrade --force-reinstall --no-deps --target "$BASE/py" "$W" > "$BASE/log/install.log" 2>&1
-echo "install rc=$?"
+WANT="$RELAY/$SWAP/$PIPE"
+if [ "$REUSE" = 1 ] && [ -f "$STATE" ] && [ "$(cat "$STATE")" = "$WANT" ] \
+   && ls "$BASE"/wheels/*.whl >/dev/null 2>&1 && [ -d "$BASE/py/fla_npu" ]; then
+  echo "REUSE=1 且档位未变（$WANT），跳过 build/install"
+  W=$(ls -t "$BASE"/wheels/*.whl | head -1)
+else
+  python3 -m pip wheel --no-build-isolation --no-deps . -w "$BASE/wheels" > "$BASE/log/build.log" 2>&1
+  echo "build rc=$?"
+  tail -3 "$BASE/log/build.log"
+  W=$(ls -t "$BASE"/wheels/*.whl | head -1)
+  echo "wheel: $W"
+  rm -rf "$BASE/py"
+  python3 -m pip install --upgrade --force-reinstall --no-deps --target "$BASE/py" "$W" > "$BASE/log/install.log" 2>&1
+  echo "install rc=$?"
+  echo "$WANT" > "$STATE"
+fi
 
 # ---------- 4) OPP 自检：档位真的进包了吗 ----------
 P=$BASE/py/fla_npu
