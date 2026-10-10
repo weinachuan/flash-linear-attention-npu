@@ -127,16 +127,69 @@ def copy_hunt(key, fwd_out, rec_out, inputs):
     return hits[:5]
 
 
+def akk_probe(u_good, u_bad, akk, v_in, beta_in):
+    """用 Akk 反解：rec 的 u 是否「用正确操作数算得出来」。
+
+    返回一行结论字符串；异常时返回原因。
+    """
+    try:
+        idx = torch.nonzero(u_good != u_bad)
+        head = int(torch.unique(idx[:, 0]).min())
+        tok = int(torch.unique(idx[:, 1]).min())
+        block = 64
+        A = bf(akk[head, tok:tok + block]).double()
+        ug = bf(u_good[head, tok:tok + block]).double()
+        ub = bf(u_bad[head, tok:tok + block]).double()
+        vv = bf(v_in[head, tok:tok + block]).double()
+        bt = bf(beta_in[head, tok:tok + block]).double()[:, None]
+        Vu, *_ = torch.linalg.lstsq(A, ug)
+        pred = A @ Vu
+        res_f = float((pred - ug).norm() / ug.norm())
+        res_r = float((pred - ub).norm() / ub.norm())
+        corr_f = float(torch.corrcoef(torch.stack([pred.reshape(-1), ug.reshape(-1)]))[0, 1])
+        corr_r = float(torch.corrcoef(torch.stack([pred.reshape(-1), ub.reshape(-1)]))[0, 1])
+        corr_v = float(torch.corrcoef(torch.stack([Vu.reshape(-1), (vv * bt).reshape(-1)]))[0, 1])
+        tag = "操作数侧/交接侧" if res_r > 1e-3 else "写回/搬运侧"
+        return (f"      Akk 反解: V_beta vs v*beta corr={corr_v:.4f} | "
+                f"rel_res(好侧)={res_f:.3e} corr={corr_f:.4f} | "
+                f"rel_res(坏侧)={res_r:.3e} corr={corr_r:.4f} => {tag}")
+    except Exception as exc:  # noqa: BLE001
+        return f"      Akk 反解跳过（{exc}）"
+
+
+def localize_tensor(key, good_val, bad_val, cu):
+    """打印某个 tensor 上"好/坏"差异的落点与幅度摘要。"""
+    out = []
+    dd = (good_val != bad_val)
+    idx = torch.nonzero(dd)
+    ax = head_token_axes(key)
+    if ax is not None:
+        ha, ta = ax
+        heads = torch.unique(idx[:, ha]).tolist()
+        toks = torch.unique(idx[:, ta])
+        seq, cin, slen = locate_token(int(toks.min()), cu)
+        ordn = [o for (sq, c, o, t0) in chunk_map(cu) if sq == seq and c == cin]
+        out.append(f"      {key}: heads={heads} tokens=[{int(toks.min())}..{int(toks.max())}] "
+                   f"-> seq={seq}(len={slen}) chunk_in_seq={cin} "
+                   f"global_chunk={ordn[0] if ordn else None}")
+    else:
+        out.append(f"      {key}: dim0={torch.unique(idx[:, 0])[:6].tolist()} "
+                   f"dim1={torch.unique(idx[:, 1]).tolist()}")
+    out.append(f"      ndiff={int(dd.sum())} 坏侧 {region_stats(bad_val[dd])} | "
+               f"好侧 {region_stats(good_val[dd])}")
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", required=True)
-    ap.add_argument("--n-stress", type=int, default=300)
-    ap.add_argument("--n-scan", type=int, default=100)
+    ap.add_argument("--n-stress", type=int, default=2000)
+    ap.add_argument("--n-scan", type=int, default=200)
     ap.add_argument("--streams", type=int, default=4)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--skip-npu", action="store_true")
-    ap.add_argument("--skip-controls", action="store_true",
-                    help="跳过 [3]/[4] 两组驱动方式对照（用例构造与 [2] 完全相同，只改并发/同步）")
+    ap.add_argument("--with-driver-controls", action="store_true",
+                    help="额外跑 [3]/[4] 两组驱动方式对照（用例构造与 [2] 完全相同，只改并发/同步）")
     ap.add_argument("--with-tnd-control", action="store_true",
                     help="额外跑 [5] TND 拼写对照。注意：那不是本 issue 的用例构造，默认不跑")
     args = ap.parse_args()
@@ -208,29 +261,11 @@ def main():
                 f"（h=每个 chunk 的 state：dim0=global_chunk；final_state=序列号）")
 
     log("[1f] Akk 反解：rec 的 u 是否与「正确操作数」的 GEMM 一致")
-    try:
-        idx = torch.nonzero(fwd_out["u"] != rec_out["u"])
-        head = int(torch.unique(idx[:, 0]).min())      # u 是 (H, T, V)
-        tok = int(torch.unique(idx[:, 1]).min())
-        block = 64
-        A = bf(fwd_out["Akk"][head, tok:tok + block]).double()
-        u_f = bf(fwd_out["u"][head, tok:tok + block]).double()
-        u_r = bf(rec_out["u"][head, tok:tok + block]).double()
-        v_in = bf(fwd_in["v_in"][head, tok:tok + block]).double()
-        beta = bf(fwd_in["beta_in"][head, tok:tok + block]).double()[:, None]
-        Vu, *_ = torch.linalg.lstsq(A, u_f)
-        pred = A @ Vu
-        res_f = float((pred - u_f).norm() / u_f.norm())
-        res_r = float((pred - u_r).norm() / u_r.norm())
-        corr_f = float(torch.corrcoef(torch.stack([pred.reshape(-1), u_f.reshape(-1)]))[0, 1])
-        corr_r = float(torch.corrcoef(torch.stack([pred.reshape(-1), u_r.reshape(-1)]))[0, 1])
-        corr_v = float(torch.corrcoef(torch.stack([Vu.reshape(-1), (v_in * beta).reshape(-1)]))[0, 1])
-        log(f"    pred = Akk @ V_beta_true; V_beta 反解与 v*beta 相关={corr_v:.4f}")
-        log(f"    rel_res(fwd u)={res_f:.3e} corr={corr_f:.4f} | rel_res(rec u)={res_r:.3e} corr={corr_r:.4f}")
-        log("    => " + ("rec 的 u 不是用正确操作数算出来的（操作数侧/交接侧）"
-                        if res_r > 1e-3 else "rec 的 u 与正确操作数一致（写回/搬运侧）"))
-    except Exception as exc:
-        log(f"    (跳过: {exc})")
+    if "u" in drifted:
+        log(akk_probe(fwd_out["u"], rec_out["u"], fwd_out["Akk"],
+                      fwd_in["v_in"], fwd_in["beta_in"]))
+    else:
+        log("    (本 dump 的 u 没有漂移，跳过)")
 
     if args.skip_npu:
         log("=" * 78)
@@ -291,6 +326,7 @@ def main():
             bad = [k for k in KEYS if len(set(per[k])) > 1]
             if bad and first_bad is None:
                 first_bad, t_bad = outs, i
+                break  # 抓到首个样本就停，现场取证比"跑满 n 统计概率"更值钱
         return hist, first_bad, t_bad
 
     warm = call(ins)
@@ -333,43 +369,47 @@ def main():
         f"/{args.n_stress} trial, 用时 {time.time() - t0:.0f}s")
 
     if first_bad is not None:
-        log(f"    [首个漂移 trial={t_bad} 的现场快照]")
-        inconsistent = []
-        for k in DEP_ORDER:
-            vals = [o[KEYS.index(k)] for o in first_bad]
-            if any(v is None for v in vals):
+        log(f"    [首个漂移 trial={t_bad} 的现场快照（与 warm 比，判「坏的一侧」）]")
+        bad_info = {}
+        for k in KEYS:
+            if k not in golden:
                 continue
-            if len({tuple(fp(v)) for v in vals}) > 1:
-                inconsistent.append(k)
-        log(f"      跨 stream 不一致的 tensor: {inconsistent}")
-        for k in DEP_ORDER:
-            if k not in inconsistent:
-                continue
-            vals = [o[KEYS.index(k)] for o in first_bad]
-            a = vals[0]
-            others = [v for v in vals[1:] if not torch.equal(v, a)]
-            if not others:
-                continue
-            dd = (a != others[0])
-            idx = torch.nonzero(dd)
-            ax = head_token_axes(k)
-            if ax is not None:
-                ha, ta = ax
-                heads = torch.unique(idx[:, ha]).tolist()
-                toks = torch.unique(idx[:, ta])
-                seq, cin, slen = locate_token(int(toks.min()), cu)
-                log(f"      最早漂移点={k}: heads={heads} tokens=[{int(toks.min())}..{int(toks.max())}] "
-                    f"-> seq={seq}(len={slen}) chunk_in_seq={cin} ndiff={int(dd.sum())} "
-                    f"坏侧 {region_stats(others[0][dd])}")
-            else:
-                log(f"      最早漂移点={k}: dim0={torch.unique(idx[:, 0])[:6].tolist()} "
-                    f"dim1={torch.unique(idx[:, 1]).tolist()} ndiff={int(dd.sum())} "
-                    f"坏侧 {region_stats(others[0][dd])}")
-            break
+            g = fp(golden[k])
+            for si, o in enumerate(first_bad):
+                v = o[KEYS.index(k)]
+                if v is not None and fp(v) != g:
+                    bad_info.setdefault(k, (si, v))
+                    break
+        log(f"      与 warm 不一致的 tensor: {sorted(bad_info)}")
+        target = next((k for k in DEP_ORDER if k in bad_info), None)
+        if target is None:
+            log("      本次样本的每个输出都能在某个 stream 上等于 warm（疑似 warm 自身偶发），跳过取证")
+        else:
+            si, bad_val = bad_info[target]
+            good_val = golden[target]
+            log(f"      最早漂移点 = {target}（出现在 stream {si}）")
+            for line in localize_tensor(target, good_val, bad_val, cu):
+                log(line)
+            fo = {k: v for k, v in golden.items()}
+            ro = {target: bad_val}
+            for j, o in enumerate(first_bad):
+                for k2 in KEYS:
+                    v = o[KEYS.index(k2)]
+                    if v is not None:
+                        ro[f"s{j}:{k2}"] = v
+            hits = copy_hunt(target, fo, ro, ins)
+            n_bad = int((good_val != bad_val).sum())
+            frac = (hits[0][0] / max(1, n_bad)) if hits else 0.0
+            log(f"      脏写检查: 最佳匹配={hits[0] if hits else None} best_frac={frac:.4f} "
+                f"({ '疑似抄了别的张量/错位搬运' if frac > 0.5 else '匹配不上 ⇒ 像读到没人写过的地方' })")
+            if target == "u":
+                log(akk_probe(good_val, bad_val, golden["Akk"], ins["v_in"], ins["beta_in"]))
+            downstream = [k for k in DEP_ORDER if k != target and k in bad_info]
+            log(f"      同一次调用里下游也漂: {downstream}")
     else:
-        log("    [首个漂移 trial] 本次没抓到（n 不够）")
+        log(f"    [首个漂移 trial] 跑满 {args.n_stress} trial 没抓到（加大 --n-stress 再试）")
 
-    if not args.skip_controls:
+    if args.with_driver_controls:
         log("=" * 78)
         log("[3] 驱动方式对照·并发度扫描（用例构造与 [2] 完全相同，只改并发数）")
         for ns in (1, 2, 4, 8):
