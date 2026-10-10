@@ -397,6 +397,14 @@ def main():
     def run_trials(n_trial, n_streams, sync_per_call=False):
         """与包内多流脚本同结构：每 trial 在 n_streams 个 stream 上各调一次，再 sync。"""
         sts = [torch.npu.Stream() for _ in range(n_streams)]
+        if not globals().get("_STREAMS_PRINTED"):
+            globals()["_STREAMS_PRINTED"] = True
+            try:
+                handles = [hex(int(s.npu_stream)) for s in sts]
+            except Exception:
+                handles = ["?" for _ in sts]
+            log(f"    已创建 {n_streams} 个 stream: {handles}"
+                + ("（>1 即多流并发）" if n_streams > 1 else "（单流基线）"))
         hist = [dict() for _ in range(n_streams)]
         first_bad = None
         t_bad = None
