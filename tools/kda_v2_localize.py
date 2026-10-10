@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 
 import torch
@@ -194,6 +195,66 @@ def progress_bar(done, total, samples, t0, width=25):
             f"{rate:.1f} trial/s  ETA {eta:.0f}s")
 
 
+def _slice_for(key, t, head, lo, hi):
+    """按张量的轴约定取"漂移附近的一小段"，尽量避免整张拷贝。"""
+    try:
+        if key == "o":                       # (T, H, V)
+            return t[lo:hi, head, :].clone()
+        if key in ("gk", "w", "u", "qg", "kg", "v_new", "Aqk", "Akk"):   # (H, T, C)
+            return t[head, lo:hi, :].clone()
+        if key == "h":                        # (chunks, H, K, V)
+            return t[hi, head].clone()
+        if key == "final_state":              # (seq, H, K, V)
+            return t[head].clone()
+        if key in ("q_in", "k_in", "v_in", "g_in"):   # (H, T, D)
+            return t[head, lo:hi, :].clone()
+        if key == "beta_in":                  # (H, T)
+            return t[head, lo:hi].clone()
+        return t.reshape(-1)[:65536].clone()
+    except Exception:
+        return t.reshape(-1)[:65536].clone()
+
+
+def save_first_sample(path, target, loc, bad_val, good_val, outs, si, cu, scalars,
+                      inputs, golden):
+    """存第一个漂移样本的关键小切片（几百 KB），供离线分析；失败不影响主流程。"""
+    try:
+        tgt, heads, tlo, thi, seq, cin, glob = loc if loc else (target, None, 0, 0,
+                                                                None, None, None)
+        head = int(heads[0]) if heads else 0
+        lo = max(0, (tlo or 0) - CHUNK)
+        hi = (thi or 0) + CHUNK
+        payload = {
+            "kind": "kda_v2_localize_first_sample",
+            "target": tgt, "loc": loc, "stream_index": si,
+            "cu_seqlens": list(cu), "chunk_size": int(scalars["chunk_size"]),
+            "layout": scalars["layout"], "scale": scalars["scale"],
+            "bad_fp": fp(bad_val), "good_fp": fp(good_val),
+        }
+        payload[f"{tgt}_bad_slice"] = _slice_for(tgt, bad_val, head, lo, hi)
+        payload[f"{tgt}_good_slice"] = _slice_for(tgt, good_val, head, lo, hi)
+        for k in KEYS:
+            v = outs[si][KEYS.index(k)]
+            if v is not None:
+                payload[f"{k}_bad_stream_slice"] = _slice_for(k, v, head, lo, hi)
+            g = golden.get(k)
+            if g is not None and k != tgt:
+                payload[f"{k}_good_slice"] = _slice_for(k, g, head, lo, hi)
+        for k in ("q_in", "k_in", "v_in", "g_in", "beta_in"):
+            v = inputs.get(k)
+            if v is not None:
+                payload[f"{k}_slice"] = _slice_for(k, v, head, lo, hi)
+        for k in ("A_log", "dt_bias"):
+            v = inputs.get(k)
+            if v is not None:
+                payload[k] = v.clone()
+        torch.save(payload, path)
+        import os
+        log(f"    已写出首样本小切片: {path} ({os.path.getsize(path) / 1024:.0f} KiB)")
+    except Exception as exc:  # noqa: BLE001
+        log(f"    !! 保存首样本失败（不影响继续跑）: {exc}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", required=True)
@@ -201,6 +262,10 @@ def main():
     ap.add_argument("--n-scan", type=int, default=200)
     ap.add_argument("--max-samples", type=int, default=5,
                     help="最多收集多少个漂移样本的落点信息（每个样本只记摘要，不落盘）")
+    ap.add_argument("--pause-on-first", action="store_true",
+                    help="抓到第一个漂移样本后暂停，等回车再继续（张量保持存活，便于现场观察）")
+    ap.add_argument("--save-first", default="",
+                    help="把第一个漂移样本的关键小切片存成 .pt（约几百 KB，可发给分析方）")
     ap.add_argument("--streams", type=int, default=4)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--skip-npu", action="store_true")
@@ -378,6 +443,18 @@ def main():
                                 "loc": loc, "bad_side": bad_side})
                 if first_bad is None:
                     first_bad, t_bad = outs, i
+                    if target is not None and (args.save_first or args.pause_on_first):
+                        si, bad_val = bad_side[target]
+                        good_val = golden[target]
+                        if args.save_first:
+                            save_first_sample(args.save_first, target, loc, bad_val,
+                                              good_val, outs, si, cu, s, ins, golden)
+                        if args.pause_on_first:
+                            log("    >>> 已抓到第一个漂移样本，张量保持存活。按回车继续…")
+                            if sys.stdin.isatty():
+                                input()
+                            else:
+                                log("    >>> stdin 不是终端（可能被 tee/重定向），跳过等待")
                 if len(samples) >= args.max_samples:
                     break
             trials_run = i + 1
