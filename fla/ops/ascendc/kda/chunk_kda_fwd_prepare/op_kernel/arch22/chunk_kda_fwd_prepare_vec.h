@@ -587,9 +587,11 @@ private:
         AscendC::GlobalTensor<bfloat16_t> kBetaRelay;
         AscendC::GlobalTensor<bfloat16_t> vBetaRelay;
         kBetaRelay.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(
-            args_.workspace + slot + Workspace::kArch22RhsKBetaG));
+            args_.workspace + slot + Workspace::kPayload +
+            Workspace::kKBetaG));
         vBetaRelay.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(
-            args_.workspace + slot + Workspace::kArch22RhsVBeta));
+            args_.workspace + slot + Workspace::kPayload +
+            Workspace::kVBeta));
 #if KDA_PREPARE_RELAY_ORDER_SWAP
         // 诊断：先 V_beta、后 K_beta_g（默认路径是反过来的）
         AscendC::DataCopy(vBetaRelay, vBeta, rhsRows * Shape::kValueDim);

@@ -593,9 +593,11 @@ private:
             AscendC::GlobalTensor<bfloat16_t> kBetaRelay;
             AscendC::GlobalTensor<bfloat16_t> vBetaRelay;
             kBetaRelay.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(
-                args_.workspace + slot + Workspace::kArch22RhsKBetaG));
+                args_.workspace + slot + Workspace::kPayload +
+                Workspace::kKBetaG));
             vBetaRelay.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t *>(
-                args_.workspace + slot + Workspace::kArch22RhsVBeta));
+                args_.workspace + slot + Workspace::kPayload +
+                Workspace::kVBeta));
 #if CHUNK_KDA_FWD_PREPARE_RELAY_SYNC >= 1
             // 读侧加固（保守）：读 AIV 刚写过的 relay 之前先让本核缓存行失效，
             // 否则 MTE2 可能命中旧行，把上一代（或空）的 K_beta_g/V_beta 读成

@@ -43,7 +43,7 @@
 //   2 = 再把 C2/C4 读入 AIV payload 的位置按同样方式加固（默认）。
 // 只影响同步强度，不改变任何计算、地址、输出档位或 tiling 数据。
 #ifndef CHUNK_KDA_FWD_PREPARE_RELAY_SYNC
-#define CHUNK_KDA_FWD_PREPARE_RELAY_SYNC 2
+#define CHUNK_KDA_FWD_PREPARE_RELAY_SYNC 0
 #endif
 
 // 诊断开关：把 V6 里两份 relay 的搬运顺序对调（V_beta 先搬、K_beta_g 后搬）。
