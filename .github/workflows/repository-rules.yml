@@ -2,8 +2,11 @@ name: 仓库规则
 
 on:
   create:
+  issues:
+    types: [opened]
   pull_request_target:
     types: [opened, edited, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
 
 jobs:
   branch-creation-guard:
@@ -81,3 +84,139 @@ jobs:
               pull_number: pr.number,
               body: nextBody,
             });
+
+  issue-template-label-sync:
+    name: 同步 issue 类型标签
+    if: github.event_name == 'issues' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: 补齐 issue 类型标签
+        uses: actions/github-script@v7
+        env:
+          BUG_LABELS: 'bug,main'
+          FEATURE_LABELS: 'enhancement'
+        with:
+          script: |
+            const splitList = (value) =>
+              (value || '').split(',').map((item) => item.trim()).filter(Boolean);
+            const labelNamesOf = (issue) =>
+              issue.labels.map((label) => (typeof label === 'string' ? label : label.name));
+
+            const { owner, repo } = context.repo;
+            const repoRef = { owner, repo };
+            const rules = [
+              {
+                type: 'Bug',
+                pattern: /^\s*\[bug\]/i,
+                labels: splitList(process.env.BUG_LABELS),
+              },
+              {
+                type: 'Feature',
+                pattern: /^\s*\[feature\]/i,
+                labels: splitList(process.env.FEATURE_LABELS),
+              },
+            ];
+            const labelDefinitions = new Map([
+              ['bug', { color: 'd73a4a', description: "Something isn't working" }],
+              ['main', { color: '1d76db', description: 'main 分支问题' }],
+              ['enhancement', { color: 'a2eeef', description: 'New feature or request' }],
+            ]);
+
+            async function ensureLabel(name) {
+              try {
+                await github.rest.issues.getLabel({ ...repoRef, name });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                const definition = labelDefinitions.get(name);
+                if (!definition) throw new Error(`未配置标签 ${name} 的创建参数`);
+                await github.rest.issues.createLabel({ ...repoRef, name, ...definition });
+                core.notice(`已创建标签 ${name}。`);
+              }
+            }
+
+            const ruleFor = (issue) => rules.find((rule) => rule.pattern.test(issue.title || ''));
+
+            async function syncIssue(issue) {
+              const rule = ruleFor(issue);
+              if (!rule) return { status: 'skipped' };
+
+              const existing = new Set(labelNamesOf(issue));
+              const missing = rule.labels.filter((name) => !existing.has(name));
+              if (missing.length === 0) return { status: 'unchanged', type: rule.type };
+
+              await github.rest.issues.addLabels({
+                ...repoRef,
+                issue_number: issue.number,
+                labels: missing,
+              });
+              return { status: 'updated', type: rule.type, labels: missing };
+            }
+
+            await Promise.all(
+              [...new Set(rules.flatMap((rule) => rule.labels))].map((name) => ensureLabel(name)),
+            );
+
+            if (context.eventName === 'workflow_dispatch') {
+              const allIssues = await github.paginate(github.rest.issues.listForRepo, {
+                ...repoRef,
+                state: 'all',
+                per_page: 100,
+              });
+              const candidates = allIssues.filter((issue) => !issue.pull_request && ruleFor(issue));
+              const results = [];
+
+              for (let index = 0; index < candidates.length; index += 8) {
+                const batch = candidates.slice(index, index + 8);
+                const batchResults = await Promise.all(
+                  batch.map(async (issue) => {
+                    try {
+                      return { number: issue.number, ...(await syncIssue(issue)) };
+                    } catch (error) {
+                      return { number: issue.number, status: 'failed', error: error.message };
+                    }
+                  }),
+                );
+                results.push(...batchResults);
+              }
+
+              const count = (status) => results.filter((result) => result.status === status).length;
+              const failures = results.filter((result) => result.status === 'failed');
+              await core.summary
+                .addHeading('Issue 类型标签回填', 2)
+                .addRaw(
+                  [
+                    `- 扫描匹配 issue：${candidates.length}`,
+                    `- 新补标签：${count('updated')}`,
+                    `- 标签已完整：${count('unchanged')}`,
+                    `- 失败：${failures.length}`,
+                    '',
+                  ].join('\n'),
+                )
+                .write();
+
+              if (failures.length) {
+                core.setFailed(
+                  `有 ${failures.length} 个 issue 补标签失败：\n${failures
+                    .map((failure) => `#${failure.number} ${failure.error}`)
+                    .join('\n')}`,
+                );
+              } else {
+                core.notice(`已扫描 ${candidates.length} 个 issue，新补标签 ${count('updated')} 个。`);
+              }
+            } else {
+              const issue = context.payload.issue;
+              try {
+                const result = await syncIssue(issue);
+                if (result.status === 'skipped') {
+                  core.notice(`#${issue.number} 未匹配 Bug/Feature 模板标题，跳过类型标签同步。`);
+                } else if (result.status === 'updated') {
+                  core.notice(`#${issue.number} 已补 ${result.type} 标签：${result.labels.join(', ')}。`);
+                } else {
+                  core.notice(`#${issue.number} 的 ${result.type} 类型标签已完整。`);
+                }
+              } catch (error) {
+                core.setFailed(`#${issue.number} 补标签失败：${error.message}`);
+              }
+            }

@@ -3,6 +3,7 @@ description: 反馈 fla_npu 使用、构建、安装或算子运行问题
 title: "[Bug]: "
 labels:
   - bug
+  - main
 body:
   - type: markdown
     attributes:
